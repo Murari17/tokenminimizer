@@ -104,6 +104,7 @@ class WorkflowOrchestrator:
                 rule_result = apply_rules(
                     data=cleaned_payload,
                     cls=classification,
+                    allow_silent_spam_drop=self.config.allow_silent_spam_drop,
                 )
 
                 # Step 5 [SMALL LLM - Minimal Cost]: Draft constrained reply

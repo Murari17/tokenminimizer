@@ -250,13 +250,17 @@ class RuleEvaluationResult(BaseModel):
 
 
 class DraftOutput(BaseModel):
-    """Stage 5 output contract (SLM Node 2): constrained response draft."""
+    """Stage 5 output contract (SLM Node 2): constrained response draft.
+
+    Note: `referenced_ticket_id` and `subject_line` are ordered before `body_text` so
+    constrained decoding emits short routing metadata before the multi-sentence body.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    referenced_ticket_id: str = Field(..., min_length=1, max_length=64)
     subject_line: str = Field(..., min_length=1, max_length=120)
     body_text: str = Field(..., min_length=1, max_length=600)
-    referenced_ticket_id: str = Field(..., min_length=1, max_length=64)
 
     @field_validator("subject_line")
     @classmethod

@@ -53,6 +53,10 @@ class EngineConfig:
     max_retries: int = 1
 
     # Validation, Outbound Dispatch & Persistence
+    allow_silent_spam_drop: bool = field(
+        default_factory=lambda: os.environ.get("TM_ALLOW_SILENT_SPAM_DROP", "true").lower()
+        in ("true", "1", "yes")
+    )
     sqlite_db_path: str = field(
         default_factory=lambda: os.environ.get("TM_SQLITE_DB_PATH", ":memory:")
     )

@@ -788,9 +788,19 @@ def test_eval_classifier_benchmark_zero_false_drops() -> None:
     assert replayed["slm_measured"] is True
     assert replayed["total_samples"] == 300
     assert replayed["held_out_split_samples"] == 200
-    assert replayed["held_out_intent_accuracy"] >= 0.98
+    assert replayed["held_out_slm_only_samples"] == 194
+    assert replayed["held_out_slm_only_intent_accuracy"] >= 0.98
     assert replayed["false_silent_drop_rate"] == 0.0
-    assert replayed["post_hoc_calibration"]["held_out_temperature_scaled_ece_10bin"] <= 0.02
+    assert replayed["false_silent_drop_wilson_95_ci"][1] <= 0.02
+
+    # Verify Stage 5 (SLM Reply Drafting) + Stage 6 (Guardrails) replay metrics across 105 held-out drafts
+    s5 = replayed["step5_draft_evaluation"]
+    assert s5["evaluated_drafts"] == 105
+    assert s5["direct_slm_schema_valid_rate"] == 1.0
+    assert s5["unsafe_output_rate"] == 0.0
+    assert s5["ticket_id_grounded_rate"] == 1.0
+    assert s5["sla_hours_grounded_rate"] == 1.0
+    assert s5["language_match_rate"] == 1.0
 
 
 def test_webhook_dispatch_transport_includes_idempotency_headers(

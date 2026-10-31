@@ -4,8 +4,10 @@ escalation flood protection, SLA calculation, and routing matrix.
 
 from __future__ import annotations
 
+from typing import Optional
 import re
 
+from src.config import DEFAULT_CONFIG
 from src.schemas import (
     ClassificationOutput,
     CleanedPayload,
@@ -31,7 +33,12 @@ def _has_transactional_customer_signals(data: CleanedPayload) -> bool:
     return bool(_TRANSACTIONAL_SIGNAL_RE.search(combined))
 
 
-def apply_rules(data: CleanedPayload, cls: ClassificationOutput) -> RuleEvaluationResult:
+def apply_rules(
+    data: CleanedPayload,
+    cls: ClassificationOutput,
+    *,
+    allow_silent_spam_drop: Optional[bool] = None,
+) -> RuleEvaluationResult:
     """Evaluate deterministic business routing rules with 0 LLM tokens.
 
     Decision Matrix:
@@ -55,13 +62,18 @@ def apply_rules(data: CleanedPayload, cls: ClassificationOutput) -> RuleEvaluati
        should_draft_reply=True, priority=LOW, sla_hours=48,
        allowed_tone="appreciative_brief", response_template_id="TPL_FEAT_01".
     """
-    # Branch 1: SPAM handling — only silent-drop to `trash` when confidence >= 0.85,
-    # no human review flag, no suspicious patterns, and no transactional signals.
-    # Borderline SPAM (< 0.85 confidence or with transactional signals) routes to `spam_review`
-    # instead of falling through to auto-drafting.
+    # Branch 1: SPAM handling — only silent-drop to `trash` when allow_silent_spam_drop is enabled,
+    # confidence >= 0.85, no human review flag, no suspicious patterns, and no transactional signals.
+    # Otherwise (or when TM_ALLOW_SILENT_SPAM_DROP=false for zero-drop safety), route to `spam_review`.
+    can_silent_drop = (
+        DEFAULT_CONFIG.allow_silent_spam_drop
+        if allow_silent_spam_drop is None
+        else allow_silent_spam_drop
+    )
     if cls.intent == IntentCategory.SPAM and not data.contains_suspicious_patterns:
         if (
-            cls.confidence >= 0.85
+            can_silent_drop
+            and cls.confidence >= 0.85
             and not cls.requires_human_review
             and not _has_transactional_customer_signals(data)
         ):

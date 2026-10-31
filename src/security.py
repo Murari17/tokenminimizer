@@ -397,6 +397,17 @@ _PROMPT_INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"""["'](?:intent|confidence|requires_human_review|should_draft_reply)["']\s*:""",
         re.IGNORECASE,
     ),
+    # 6. Multilingual prompt-injection overrides (Spanish, French, German, Portuguese, Japanese)
+    re.compile(
+        r"(?:ignora(?:r)?\s+(?:todas\s+)?las\s+instrucciones\s+(?:anteriores|previas)|"
+        r"olvida\s+todo\s+lo\s+anterior|"
+        r"ignore[rz]?\s+(?:toutes\s+)?les\s+instructions\s+(?:précédentes|ci-dessus)|"
+        r"oubliez\s+tout\s+ce\s+qui\s+précède|"
+        r"ignorier(?:e|en)\s+(?:alle\s+)?(?:vorherigen\s+|obigen\s+)?anweisungen|"
+        r"ignore\s+todas\s+as\s+instruções\s+(?:anteriores|acima)|"
+        r"以前の指示を(?:すべて|全て)?無視|上記の指示を無視)",
+        re.IGNORECASE,
+    ),
 )
 
 _BASE64_TOKEN_RE = re.compile(r"\b[A-Za-z0-9+/]{32,512}={0,2}\b")
@@ -533,6 +544,27 @@ _FORBIDDEN_COMMITMENT_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"\b(?:legal\s+liability|legally\s+liable|at\s+fault|our\s+negligence|"
         r"lawsuits?|litigation|class\s+action|binding\s+settlement|unconditional\s+compensation|"
         r"sue|suing|legal\s+action|court\s+action|breach\s+of\s+contract)\b",
+        re.IGNORECASE,
+    ),
+    # Multilingual unauthorized refund/liability/legal commitments (ES, FR, DE, PT, JA)
+    re.compile(
+        r"(?:reembolso\s+(?:completo|total|100%)\s+garantizado|"
+        r"garantizamos\s+(?:un\s+|el\s+)?reembolso|"
+        r"aceptamos\s+(?:toda\s+)?la\s+responsabilidad\s+legal|"
+        r"acci[oó]n\s+legal|vamos\s+a\s+demandar|"
+        r"remboursement\s+(?:int[eé]gral|total)\s+garanti|"
+        r"nous\s+garantissons\s+un\s+remboursement|"
+        r"nous\s+acceptons\s+(?:toute\s+)?la\s+responsabilit[eé]|"
+        r"action\s+en\s+justice|"
+        r"volle\s+r[uü]ckerstattung\s+garantiert|"
+        r"wir\s+garantieren\s+eine\s+r[uü]ckerstattung|"
+        r"wir\s+[uü]bernehmen\s+die\s+(?:volle\s+)?haftung|"
+        r"rechtliche\s+schritte|"
+        r"reembolso\s+total\s+garantido|"
+        r"garantimos\s+o\s+reembolso|"
+        r"aceitamos\s+total\s+responsabilidade|"
+        r"a[cç][aã]o\s+judicial|"
+        r"全額返金を保証|返金を保証します|全責任を負います|法的措置)",
         re.IGNORECASE,
     ),
 )

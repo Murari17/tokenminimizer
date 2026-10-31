@@ -40,17 +40,31 @@ A production-grade, local-first **Token-Minimizing Workflow Engine** in Python b
 [Step 2: Clean & Normalize]  (CODE - 0 Tokens)              -> NFKC + Zero-Width Strip + Safe HTML Strip (<5 preserved) + Injection Scan
           │
           ▼
-[Step 3: SLM Classification] (SLM  - ≤128 Completion Toks)  -> gemma4:e4b-it-qat (0 tokens on suspicious/empty; ~46 avg completion tokens)
+[Step 3: SLM Classification] (SLM  - ≤128 Completion Toks)  -> gemma4:e4b-it-qat (~336 avg prompt + ~46 avg completion tokens; 0 tokens on suspicious/empty)
           │
           ▼
 [Step 4: Rules Engine]       (CODE - 0 Tokens)              -> Lease Heartbeat + Corroborated SPAM Gating + Timeout Triage + SLA Matrix
           │
           ▼
-[Step 5: SLM Reply Draft]    (SLM  - ≤200 Completion Toks)  -> gemma4:e4b-it-qat (XML-bounded subject+body; 0 tokens on Spam/Escalation; static fallback)
+[Step 5: SLM Reply Draft]    (SLM  - ≤200 Completion Toks)  -> gemma4:e4b-it-qat (Language-matched XML-bounded draft; 0 tokens on Spam/Escalation; localized fallback)
           │
           ▼
-[Step 6: Validate & Dispatch](CODE - 0 Tokens)              -> Guardrails + CAS Lease-Token Check + Transport Send + Finalize SENT
+[Step 6: Validate & Dispatch](CODE - 0 Tokens)              -> Multilingual Guardrails + CAS Lease-Token Check + Idempotent Send + Finalize SENT
 ```
+
+---
+
+## Economics, Latency & Frontier API Tradeoff
+
+This architecture is designed for **deterministic control flow, on-premise data privacy, and predictable high-volume cost**, not raw single-request speed:
+
+| Dimension | Local SLM (`gemma4:e4b-it-qat` via Ollama) | Cloud Frontier Flash/Mini API |
+| :--- | :--- | :--- |
+| **Per-Call Latency (p50 / p95)** | `~14.1 s` / `~18.1 s` per SLM call (`~25–30 s` total for a 2-call drafted ticket on local Apple Silicon) | `~1.0–2.5 s` per call (`~3–4 s` total per drafted ticket) |
+| **Measured Token Budget (Step 3)** | `336.4` avg prompt tokens + `45.8` avg completion tokens (`0` tokens on Stage 2 short-circuits) | Same prompt/completion volume billed per token |
+| **Marginal API Spend** | **`\$0.00`** per ticket (fixed local hardware electricity/amortization) | `~\$0.0002–\$0.001` per ticket (`~\$200–\$1,000` per 1M tickets) |
+| **Data Residency & Privacy** | **100% local** — customer PII, stack traces, and credentials never leave the host | Requires external network egress to a third-party API |
+| **Silent-Drop Risk Controls** | Configurable via `TM_ALLOW_SILENT_SPAM_DROP` (set `false` to route all spam to `spam_review` with 0 silent drops) | Same deterministic Stage 4 rules |
 
 ---
 

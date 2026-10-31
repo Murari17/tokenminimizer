@@ -346,3 +346,55 @@ def test_step6_blocks_forbidden_commitment_and_unallowed_url(
     assert receipt.status == DispatchStatus.BLOCKED_VALIDATION
     assert receipt.final_payload is None
     assert len(outbox.sent_messages) == 0
+
+
+def test_step4_disable_silent_spam_drop_routes_to_spam_review(
+    sample_cleaned_payload: CleanedPayload,
+) -> None:
+    from uuid import uuid4
+
+    benign_looking_spam = CleanedPayload(
+        event_id=uuid4(),
+        sender="promo@agency.biz",
+        clean_subject="SEO ranking offer",
+        clean_body="Buy 500 backlinks today for $99.",
+        extracted_urls=[],
+        word_count=7,
+        contains_suspicious_patterns=False,
+    )
+    cls = ClassificationOutput(
+        intent=IntentCategory.SPAM,
+        confidence=0.98,
+        detected_entities=[],
+        requires_human_review=False,
+    )
+    rules_no_drop = apply_rules(benign_looking_spam, cls, allow_silent_spam_drop=False)
+    assert rules_no_drop.assigned_queue == "spam_review"
+    assert rules_no_drop.escalate_to_human is True
+    assert rules_no_drop.should_draft_reply is False
+
+
+def test_step5_multilingual_static_fallback_matches_customer_language() -> None:
+    from uuid import uuid4
+    from src.pipeline.step5_draft import detect_language, render_static_fallback_draft
+
+    es_payload = CleanedPayload(
+        event_id=uuid4(),
+        sender="cliente@empresa.es",
+        clean_subject="Factura duplicada",
+        clean_body="Hola equipo, nos han cobrado dos veces la factura en nuestra tarjeta.",
+        extracted_urls=[],
+        word_count=12,
+        contains_suspicious_patterns=False,
+    )
+    cls = ClassificationOutput(
+        intent=IntentCategory.BILLING,
+        confidence=0.95,
+        detected_entities=[],
+        requires_human_review=False,
+    )
+    rules = apply_rules(es_payload, cls)
+    fallback_draft = render_static_fallback_draft(es_payload, rules)
+    assert detect_language(fallback_draft.body_text) == "es"
+    assert str(rules.sla_hours) in fallback_draft.body_text
+    assert fallback_draft.referenced_ticket_id in fallback_draft.body_text

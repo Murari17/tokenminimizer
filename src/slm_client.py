@@ -108,8 +108,8 @@ def extract_and_repair_json(raw_text: str) -> Dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
-    # Repair path: if truncated inside a trailing array/string (such as `detected_entities`),
-    # strip the incomplete tail back to the last complete key-value comma or opening bracket.
+    # Repair path 1: if truncated inside a trailing array (such as `detected_entities`),
+    # strip the incomplete tail back to the last complete key-value comma.
     if '"detected_entities"' in candidate:
         prefix, _, _ = candidate.partition('"detected_entities"')
         prefix_clean = prefix.rstrip().rstrip(",")
@@ -118,6 +118,17 @@ def extract_and_repair_json(raw_text: str) -> Dict[str, Any]:
             parsed = json.loads(repaired)
             if isinstance(parsed, dict):
                 parsed.setdefault("detected_entities", [])
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Repair path 2: if truncated inside a trailing `body_text` string after `referenced_ticket_id`
+    # and `subject_line` were already emitted, close the string and object cleanly.
+    if '"body_text"' in candidate and '"referenced_ticket_id"' in candidate:
+        repaired_body = candidate.rstrip().rstrip("\\") + '"}'
+        try:
+            parsed = json.loads(repaired_body)
+            if isinstance(parsed, dict) and parsed.get("body_text"):
                 return parsed
         except json.JSONDecodeError:
             pass
