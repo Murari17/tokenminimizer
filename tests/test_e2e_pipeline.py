@@ -1,12 +1,13 @@
 """End-to-end 6-stage integration tests, concurrent duplicate-send prevention,
-mid-pipeline failure recovery + retry reclamation, stale PENDING lease sweep,
-at-most-once reconciliation logging, and classifier evaluation verification.
+fencing-token (`lease_token`) compare-and-swap under lease expiry, mid-pipeline failure
+recovery + retry reclamation, stale PENDING lease sweep, and evaluation verification.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List
@@ -193,6 +194,122 @@ def test_e2e_same_signed_event_from_5_concurrent_threads_dispatches_only_once(
     assert memory_db.count_logs() == 1
 
 
+def test_e2e_expired_lease_reclaimed_while_slow_worker_running_sends_only_once(
+    make_signed_trigger,
+    secret_key: str,
+    slm_client: LocalSLMClient,
+    mock_ollama: MockOllamaController,
+    memory_db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for lease-expiry race (fencing token compare-and-swap):
+    - Lease is set to 0.12s.
+    - Worker 1 reserves the event (attempt=1, token_1), completes Step 3, then takes 0.30s in Step 5.
+    - At t=0.18s (lease expired while Worker 1 is still running), Worker 2 retries, reclaims the row
+      (attempt=2, token_2), and finishes or races with Worker 1.
+    - Because `begin_dispatch_reconciliation` and `finalize_dispatch` enforce CAS on `lease_token`,
+      Worker 1's stale `token_1` is rejected with `StaleLeaseError`/`ReplayAttackError` BEFORE
+      calling `transport.send()`.
+    - Result: 1 SENT receipt, 1 rejected stale worker, 1 DB row (status='SENT', attempt=2), and ONLY 1 sent message!
+    """
+    outbox = InMemoryOutboxTransport()
+    raw = make_signed_trigger(
+        sender="slow.worker@enterprise.io",
+        raw_subject="Lease token CAS test",
+        raw_body="Please check invoice INV-303.",
+    )
+
+    # Queue responses for both Worker 1 and Worker 2
+    for _ in range(2):
+        mock_ollama.queue_ollama_json(
+            {
+                "intent": "BILLING",
+                "confidence": 0.93,
+                "detected_entities": ["INV-303"],
+                "requires_human_review": False,
+            },
+            prompt_eval_count=40,
+            eval_count=20,
+        )
+        mock_ollama.queue_ollama_json(
+            {
+                "subject_line": "Re: Lease token CAS test [TKT-303]",
+                "body_text": "We have logged your inquiry for INV-303 under TKT-303.",
+                "referenced_ticket_id": "TKT-303",
+            },
+            prompt_eval_count=50,
+            eval_count=25,
+        )
+
+    orchestrator = WorkflowOrchestrator(
+        config=EngineConfig(webhook_secret=secret_key, pending_lease_seconds=0.12),
+        slm_client=slm_client,
+        db=memory_db,
+        transport=outbox,
+    )
+
+    original_draft = orchestrator_mod.draft_response
+    worker_counter = {"count": 0}
+    counter_lock = threading.Lock()
+    worker1_in_step5 = threading.Event()
+
+    def _delayed_first_worker_draft(*args, **kwargs):
+        with counter_lock:
+            worker_counter["count"] += 1
+            my_num = worker_counter["count"]
+        draft = original_draft(*args, **kwargs)
+        if my_num == 1:
+            worker1_in_step5.set()
+            # Sleep past the 0.12s lease so Worker 2 reclaims the row while Worker 1 is still alive
+            time.sleep(0.28)
+        return draft
+
+    monkeypatch.setattr(orchestrator_mod, "draft_response", _delayed_first_worker_draft)
+
+    successes: List[DispatchReceipt] = []
+    stale_errors: List[Exception] = []
+    result_lock = threading.Lock()
+
+    def _run_worker_1() -> None:
+        try:
+            r = orchestrator.process_event(raw)
+            with result_lock:
+                successes.append(r)
+        except DuplicateEventError as exc:
+            with result_lock:
+                stale_errors.append(exc)
+
+    def _run_worker_2() -> None:
+        worker1_in_step5.wait(timeout=2.0)
+        # Wait until Worker 1's 0.12s lease has expired
+        time.sleep(0.16)
+        try:
+            r = orchestrator.process_event(raw)
+            with result_lock:
+                successes.append(r)
+        except DuplicateEventError as exc:
+            with result_lock:
+                stale_errors.append(exc)
+
+    t1 = threading.Thread(target=_run_worker_1)
+    t2 = threading.Thread(target=_run_worker_2)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert len(successes) == 1
+    assert successes[0].status == DispatchStatus.SENT
+    assert len(stale_errors) == 1
+    assert len(outbox.sent_messages) == 1
+    assert memory_db.count_logs() == 1
+
+    row = memory_db.get_audit_log(successes[0].audit_log_id)
+    assert row is not None
+    assert row["status"] == "SENT"
+    assert row["attempt"] == 2
+
+
 def test_e2e_mid_pipeline_exception_marks_failed_and_allows_retry_to_succeed(
     make_signed_trigger,
     secret_key: str,
@@ -231,7 +348,6 @@ def test_e2e_mid_pipeline_exception_marks_failed_and_allows_retry_to_succeed(
 
     monkeypatch.setattr(orchestrator_mod, "draft_response", _flaky_draft_response)
 
-    # Attempt 1: Classification succeeds, then Step 5 raises unhandled RuntimeError
     mock_ollama.queue_ollama_json(
         {
             "intent": "BILLING",
@@ -245,7 +361,6 @@ def test_e2e_mid_pipeline_exception_marks_failed_and_allows_retry_to_succeed(
     with pytest.raises(RuntimeError, match="Simulated mid-pipeline OOM"):
         orchestrator.process_event(raw)
 
-    # Verify the row is NOT stuck in PENDING — it is marked FAILED and escalated to dlq_human_recovery
     logs = memory_db.get_logs_by_event_id(raw["event_id"])
     assert len(logs) == 1
     assert logs[0]["status"] == "FAILED"
@@ -254,7 +369,6 @@ def test_e2e_mid_pipeline_exception_marks_failed_and_allows_retry_to_succeed(
     assert "Simulated mid-pipeline OOM" in logs[0]["error_detail"]
     assert len(outbox.sent_messages) == 0
 
-    # Attempt 2 (Sender retries the exact same signed event): reclaims the FAILED row and succeeds!
     mock_ollama.queue_ollama_json(
         {
             "intent": "BILLING",
@@ -283,27 +397,24 @@ def test_e2e_mid_pipeline_exception_marks_failed_and_allows_retry_to_succeed(
     updated_log = memory_db.get_audit_log(retry_receipt.audit_log_id)
     assert updated_log is not None
     assert updated_log["status"] == "SENT"
+    assert updated_log["attempt"] == 2
     assert updated_log["error_detail"] is None
 
-    # Verify reconciliation log was recorded and marked DELIVERED
     rec_logs = memory_db.get_reconciliation_logs(raw["event_id"])
     assert len(rec_logs) == 1
     assert rec_logs[0]["state"] == "DELIVERED"
 
-    # Attempt 3 (Replay after SENT): now rejected as a replay!
     with pytest.raises(ReplayAttackError, match="Replay detected"):
         orchestrator.process_event(raw)
 
 
-def test_e2e_stale_pending_lease_reclaim_and_background_sweeper(
+def test_e2e_stale_pending_lease_reclaim_and_startup_sweeper(
+    secret_key: str,
+    slm_client: LocalSLMClient,
     memory_db: Database,
 ) -> None:
-    """Verify hard-crash recovery:
-    1. A `PENDING` row from a hard crash (that skipped `except`) cannot be reclaimed before lease expiry.
-    2. Once `lease_seconds` elapses, `reserve_event` reclaims it cleanly.
-    3. `sweep_stale_pending` transitions unretried stale `PENDING`/`DISPATCHING` rows to `ESCALATED`.
-    """
-    t0 = datetime.now(timezone.utc)
+    """Verify hard-crash recovery & automatic startup sweeping in WorkflowOrchestrator."""
+    t0 = datetime.now(timezone.utc) - timedelta(seconds=200)
     crashed_event_id = uuid4()
 
     row_id = memory_db.reserve_event(
@@ -314,33 +425,14 @@ def test_e2e_stale_pending_lease_reclaim_and_background_sweeper(
         now=t0,
     )
 
-    # 10 seconds later (lease not yet expired): duplicate attempt is rejected
-    with pytest.raises(DuplicateEventError):
-        memory_db.reserve_event(
-            event_id=crashed_event_id,
-            sender="crash@client.org",
-            clean_subject="Hard crash test",
-            lease_seconds=60.0,
-            now=t0 + timedelta(seconds=10),
-        )
-
-    # 65 seconds later (lease expired): retry reclaims the same row ID!
-    reclaimed_id = memory_db.reserve_event(
-        event_id=crashed_event_id,
-        sender="crash@client.org",
-        clean_subject="Hard crash test",
-        lease_seconds=60.0,
-        now=t0 + timedelta(seconds=65),
+    # Initializing WorkflowOrchestrator automatically sweeps stale PENDING rows
+    _ = WorkflowOrchestrator(
+        config=EngineConfig(webhook_secret=secret_key, pending_lease_seconds=60.0),
+        slm_client=slm_client,
+        db=memory_db,
     )
-    assert reclaimed_id == row_id
 
-    # If still unfinalized after another 70s, background sweeper transitions it to ESCALATED
-    swept_count = memory_db.sweep_stale_pending(
-        lease_seconds=60.0,
-        now=t0 + timedelta(seconds=140),
-    )
-    assert swept_count == 1
-    swept_row = memory_db.get_audit_log(row_id)
+    swept_row = memory_db.get_audit_log(int(row_id))
     assert swept_row is not None
     assert swept_row["status"] == "ESCALATED"
     assert swept_row["assigned_queue"] == "dlq_reconciliation"

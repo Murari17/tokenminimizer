@@ -1,5 +1,5 @@
-"""Stage 6 [CODE — 0 Tokens]: Output guardrails, PII leak check, atomic SQLite reservation
-before dispatch, pre-send reconciliation logging, and outbound delivery transport.
+"""Stage 6 [CODE — 0 Tokens]: Output guardrails, PII leak check, fencing-token CAS
+transition (`PENDING` -> `DISPATCHING` -> `SENT`), and outbound delivery transport.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Deque, Iterable, Optional, Protocol
 from uuid import UUID
 
 from src.config import DEFAULT_CONFIG
-from src.database import Database
+from src.database import Database, LeaseReservation, StaleLeaseError
 from src.schemas import (
     CleanedPayload,
     DispatchReceipt,
@@ -146,10 +146,18 @@ def validate_save_send(
     tokens_used: int = 0,
     allowed_domains: Iterable[str] = DEFAULT_CONFIG.allowed_domains,
     transport: Optional[DispatchTransport] = None,
-    reserved_log_id: Optional[int] = None,
+    reserved_log_id: Optional[int | LeaseReservation] = None,
+    lease_token: Optional[str] = None,
 ) -> DispatchReceipt:
-    """Atomically reserve `event_id`, log pre-send reconciliation, send, and finalize to `SENT`."""
-    audit_log_id = (
+    """Atomically verify fencing `lease_token`, send draft, and finalize to `SENT`.
+
+    - Compare-and-swaps `PENDING` -> `DISPATCHING` using `lease_token` immediately before
+      calling `active_transport.send()`. If the worker's lease expired and was reclaimed,
+      `begin_dispatch_reconciliation` raises `StaleLeaseError` and aborts with zero send.
+    - Separates `active_transport.send()` error handling from `complete_dispatch_reconciliation()`
+      so a post-send bookkeeping exception never mislabels a delivered message as `SEND_ERROR`.
+    """
+    reservation = (
         reserved_log_id
         if reserved_log_id is not None
         else db.reserve_event(
@@ -158,6 +166,7 @@ def validate_save_send(
             clean_subject=data.clean_subject,
         )
     )
+    effective_token = lease_token or getattr(reservation, "lease_token", None)
 
     try:
         active_transport = (
@@ -174,44 +183,57 @@ def validate_save_send(
                 escalate_to_human = True
         else:
             if is_draft_safe(draft, allowed_domains=allowed_domains):
+                # CAS check (`WHERE id=? AND status='PENDING' AND lease_token=?`):
+                # Raises StaleLeaseError BEFORE `send()` if another worker reclaimed the lease!
                 rec_id = db.begin_dispatch_reconciliation(
-                    audit_log_id=audit_log_id,
+                    audit_log_id=reservation,
                     event_id=data.event_id,
                     recipient=data.sender,
                     referenced_ticket_id=draft.referenced_ticket_id,
+                    lease_token=effective_token,
                 )
                 try:
                     active_transport.send(data, draft)
-                    db.complete_dispatch_reconciliation(rec_id, state="DELIVERED")
-                    status = DispatchStatus.SENT
-                    final_payload = draft
                 except Exception:
                     db.complete_dispatch_reconciliation(rec_id, state="SEND_ERROR")
                     status = DispatchStatus.ESCALATED
                     escalate_to_human = True
                     final_payload = None
+                else:
+                    status = DispatchStatus.SENT
+                    final_payload = draft
+                    db.complete_dispatch_reconciliation(rec_id, state="DELIVERED")
             else:
                 status = DispatchStatus.BLOCKED_VALIDATION
                 escalate_to_human = True
                 final_payload = None
 
         db.finalize_dispatch(
-            audit_log_id,
+            reservation,
             data=data,
             rules=rules,
             status=status,
             draft=final_payload,
             escalate_to_human=escalate_to_human,
             tokens_used=tokens_used,
+            lease_token=effective_token,
         )
 
         return DispatchReceipt(
             event_id=data.event_id,
             status=status,
             final_payload=final_payload,
-            audit_log_id=audit_log_id,
+            audit_log_id=int(reservation),
             tokens_used=tokens_used,
         )
+    except StaleLeaseError:
+        # Stale worker lost its lease to a newer attempt; do not touch the newer attempt's row!
+        raise
     except Exception as exc:
-        db.mark_failed(audit_log_id, error_detail=str(exc), tokens_used=tokens_used)
+        db.mark_failed(
+            reservation,
+            error_detail=str(exc),
+            tokens_used=tokens_used,
+            lease_token=effective_token,
+        )
         raise

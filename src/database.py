@@ -1,6 +1,6 @@
-"""Thread-safe parameterized SQLite persistence layer with atomic reservation (`status='PENDING'`),
-lease-based stale `PENDING` reclamation, mid-pipeline failure finalization (`status='FAILED'`),
-and pre-send reconciliation logging for at-most-once delivery.
+"""Thread-safe parameterized SQLite persistence layer with fencing-token (`lease_token`)
+compare-and-swap (CAS), lease heartbeats, stale `PENDING` reclamation, and pre-send
+reconciliation logging for strict at-most-once delivery.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from src.config import DEFAULT_CONFIG
 from src.schemas import (
@@ -25,8 +25,35 @@ class DuplicateEventError(ValueError):
     """Raised when an event_id has already been reserved or processed (replay/race protection)."""
 
 
+class StaleLeaseError(DuplicateEventError):
+    """Raised when a worker's lease_token has been superseded by a newer attempt or sweeper."""
+
+
+class LeaseReservation(int):
+    """An `int` row ID that also carries the unique fencing `lease_token` for compare-and-swap."""
+
+    lease_token: str
+
+    def __new__(cls, row_id: int, lease_token: str) -> "LeaseReservation":
+        instance = super().__new__(cls, row_id)
+        instance.lease_token = lease_token
+        return instance
+
+    @property
+    def audit_log_id(self) -> int:
+        return int(self)
+
+
+def _extract_id_and_token(
+    reservation: int | LeaseReservation,
+    explicit_token: Optional[str] = None,
+) -> tuple[int, Optional[str]]:
+    token = explicit_token or getattr(reservation, "lease_token", None)
+    return int(reservation), token
+
+
 class Database:
-    """Thread-safe SQLite persistence layer enforcing parameterized queries and lease-backed reservations."""
+    """Thread-safe SQLite persistence layer enforcing parameterized queries and fencing-token CAS."""
 
     def __init__(self, db_path: str = ":memory:") -> None:
         self.db_path = db_path
@@ -44,6 +71,8 @@ class Database:
                 CREATE TABLE IF NOT EXISTS audit_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_id TEXT NOT NULL UNIQUE,
+                    lease_token TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 1,
                     sender TEXT NOT NULL,
                     clean_subject TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -64,6 +93,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS dispatch_reconciliation (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     audit_log_id INTEGER NOT NULL,
+                    lease_token TEXT NOT NULL,
                     event_id TEXT NOT NULL,
                     recipient TEXT NOT NULL,
                     referenced_ticket_id TEXT NOT NULL,
@@ -102,22 +132,16 @@ class Database:
         clean_subject: str = "",
         lease_seconds: float = DEFAULT_CONFIG.pending_lease_seconds,
         now: Optional[datetime] = None,
-    ) -> int:
-        """Atomically reserve `event_id` with `status='PENDING'` or reclaim if `FAILED` / lease-expired.
+    ) -> LeaseReservation:
+        """Atomically reserve `event_id` with a fresh fencing `lease_token`, or reclaim if expired/FAILED.
 
-        - If no row exists for `event_id`: inserts `status='PENDING'` and returns `id`.
-        - If an existing row has `status == 'FAILED'` (from an earlier unhandled exception before
-          dispatch) OR has `status == 'PENDING'` whose lease (`lease_seconds`) has expired (from
-          a hard process crash before `send()`): atomically reclaims the row back to `PENDING` with
-          a fresh timestamp and returns its `id`.
-        - If an existing row is in `DISPATCHING` (crash occurred while `transport.send()` was in
-          flight) or a terminal status (`SENT`, `DROPPED_SPAM`, `ESCALATED`, `BLOCKED_VALIDATION`),
-          or is an active non-expired `PENDING` reservation: raises `DuplicateEventError` to guarantee
-          at-most-once delivery.
+        Returns a `LeaseReservation(row_id, lease_token)` (which is an `int` subclass for full
+        backward compatibility while carrying `.lease_token` for compare-and-swap verification).
         """
         reference_now = now or datetime.now(timezone.utc)
         now_iso = reference_now.isoformat()
         event_id_str = str(event_id)
+        new_token = uuid4().hex
 
         with self._lock:
             cursor = self._conn.cursor()
@@ -126,6 +150,8 @@ class Database:
                     """
                     INSERT INTO audit_logs (
                         event_id,
+                        lease_token,
+                        attempt,
                         sender,
                         clean_subject,
                         status,
@@ -138,20 +164,19 @@ class Database:
                         error_detail,
                         created_at,
                         updated_at
-                    ) VALUES (?, ?, ?, 'PENDING', 'LOW', 'pending', 0, 0, 0, NULL, NULL, ?, ?)
+                    ) VALUES (?, ?, 1, ?, ?, 'PENDING', 'LOW', 'pending', 0, 0, 0, NULL, NULL, ?, ?)
                     """,
-                    (event_id_str, sender, clean_subject, now_iso, now_iso),
+                    (event_id_str, new_token, sender, clean_subject, now_iso, now_iso),
                 )
                 self._conn.commit()
                 row_id = cursor.lastrowid
                 if row_id is None:
                     raise RuntimeError("Failed to retrieve SQLite lastrowid after event reservation.")
-                return int(row_id)
+                return LeaseReservation(int(row_id), new_token)
             except sqlite3.IntegrityError as exc:
                 self._conn.rollback()
-                # Check if existing row is eligible for reclaim (FAILED or expired PENDING lease)
                 cursor.execute(
-                    "SELECT id, status, updated_at FROM audit_logs WHERE event_id = ? LIMIT 1",
+                    "SELECT id, status, updated_at, attempt FROM audit_logs WHERE event_id = ? LIMIT 1",
                     (event_id_str,),
                 )
                 existing = cursor.fetchone()
@@ -166,10 +191,13 @@ class Database:
                         )
                     )
                     if reclaimable:
+                        next_attempt = int(existing["attempt"]) + 1
                         cursor.execute(
                             """
                             UPDATE audit_logs
-                            SET sender = ?,
+                            SET lease_token = ?,
+                                attempt = ?,
+                                sender = ?,
                                 clean_subject = ?,
                                 status = 'PENDING',
                                 priority = 'LOW',
@@ -180,73 +208,159 @@ class Database:
                                 draft_json = NULL,
                                 error_detail = NULL,
                                 updated_at = ?
-                            WHERE id = ?
+                            WHERE id = ? AND status = ? AND updated_at = ?
                             """,
-                            (sender, clean_subject, now_iso, int(existing["id"])),
+                            (
+                                new_token,
+                                next_attempt,
+                                sender,
+                                clean_subject,
+                                now_iso,
+                                int(existing["id"]),
+                                row_status,
+                                existing["updated_at"],
+                            ),
                         )
-                        self._conn.commit()
-                        return int(existing["id"])
+                        if cursor.rowcount == 1:
+                            self._conn.commit()
+                            return LeaseReservation(int(existing["id"]), new_token)
+                        self._conn.rollback()
 
                 raise DuplicateEventError(
                     f"Replay detected: event_id {event_id_str} is already reserved or processed."
                 ) from exc
 
-    def mark_failed(
+    def heartbeat_lease(
         self,
-        audit_log_id: int,
-        error_detail: str,
-        tokens_used: int = 0,
-    ) -> None:
-        """Transition a `PENDING` reservation to `FAILED` (escalated to `dlq_human_recovery`) on unhandled error."""
-        now_iso = datetime.now(timezone.utc).isoformat()
+        audit_log_id: int | LeaseReservation,
+        lease_token: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Refresh `updated_at` between pipeline stages if and only if `lease_token` still matches."""
+        row_id, token = _extract_id_and_token(audit_log_id, lease_token)
+        if not token:
+            return True
+        now_iso = (now or datetime.now(timezone.utc)).isoformat()
         with self._lock:
             cursor = self._conn.cursor()
             cursor.execute(
                 """
                 UPDATE audit_logs
-                SET status = 'FAILED',
-                    priority = 'HIGH',
-                    assigned_queue = 'dlq_human_recovery',
-                    sla_hours = 1,
-                    escalate_to_human = 1,
-                    tokens_used = ?,
-                    error_detail = ?,
-                    updated_at = ?
-                WHERE id = ? AND status = 'PENDING'
+                SET updated_at = ?
+                WHERE id = ? AND status = 'PENDING' AND lease_token = ?
                 """,
-                (int(tokens_used), error_detail[:500], now_iso, int(audit_log_id)),
+                (now_iso, row_id, token),
             )
             self._conn.commit()
+            return cursor.rowcount == 1
 
-    def begin_dispatch_reconciliation(
+    def mark_failed(
         self,
-        audit_log_id: int,
-        event_id: UUID | str,
-        recipient: str,
-        referenced_ticket_id: str,
-    ) -> int:
-        """Record an `IN_FLIGHT` reconciliation entry and transition row to `DISPATCHING` prior to `send()`."""
+        audit_log_id: int | LeaseReservation,
+        error_detail: str,
+        tokens_used: int = 0,
+        lease_token: Optional[str] = None,
+    ) -> bool:
+        """Transition a `PENDING` reservation to `FAILED` only if `lease_token` still matches.
+
+        Prevents a slow/stale worker whose lease expired from clobbering a newer worker's state.
+        """
+        row_id, token = _extract_id_and_token(audit_log_id, lease_token)
         now_iso = datetime.now(timezone.utc).isoformat()
         with self._lock:
             cursor = self._conn.cursor()
-            cursor.execute(
-                "UPDATE audit_logs SET status = 'DISPATCHING', updated_at = ? WHERE id = ?",
-                (now_iso, int(audit_log_id)),
-            )
+            if token is not None:
+                cursor.execute(
+                    """
+                    UPDATE audit_logs
+                    SET status = 'FAILED',
+                        priority = 'HIGH',
+                        assigned_queue = 'dlq_human_recovery',
+                        sla_hours = 1,
+                        escalate_to_human = 1,
+                        tokens_used = ?,
+                        error_detail = ?,
+                        updated_at = ?
+                    WHERE id = ? AND status = 'PENDING' AND lease_token = ?
+                    """,
+                    (int(tokens_used), error_detail[:500], now_iso, row_id, token),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE audit_logs
+                    SET status = 'FAILED',
+                        priority = 'HIGH',
+                        assigned_queue = 'dlq_human_recovery',
+                        sla_hours = 1,
+                        escalate_to_human = 1,
+                        tokens_used = ?,
+                        error_detail = ?,
+                        updated_at = ?
+                    WHERE id = ? AND status = 'PENDING'
+                    """,
+                    (int(tokens_used), error_detail[:500], now_iso, row_id),
+                )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def begin_dispatch_reconciliation(
+        self,
+        audit_log_id: int | LeaseReservation,
+        event_id: UUID | str,
+        recipient: str,
+        referenced_ticket_id: str,
+        lease_token: Optional[str] = None,
+    ) -> int:
+        """Compare-and-swap `PENDING` -> `DISPATCHING` using `lease_token` before `transport.send()`.
+
+        If `rowcount == 0` (meaning the lease expired and was reclaimed by another worker or swept),
+        raises `StaleLeaseError` so the stale worker aborts BEFORE calling `transport.send()`.
+        """
+        row_id, token = _extract_id_and_token(audit_log_id, lease_token)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            cursor = self._conn.cursor()
+            if token is not None:
+                cursor.execute(
+                    """
+                    UPDATE audit_logs
+                    SET status = 'DISPATCHING', updated_at = ?
+                    WHERE id = ? AND status = 'PENDING' AND lease_token = ?
+                    """,
+                    (now_iso, row_id, token),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE audit_logs
+                    SET status = 'DISPATCHING', updated_at = ?
+                    WHERE id = ? AND status = 'PENDING'
+                    """,
+                    (now_iso, row_id),
+                )
+            if cursor.rowcount == 0:
+                self._conn.rollback()
+                raise StaleLeaseError(
+                    f"Stale lease token for audit_log_id={row_id}; aborting send to prevent duplicate dispatch."
+                )
+
             cursor.execute(
                 """
                 INSERT INTO dispatch_reconciliation (
                     audit_log_id,
+                    lease_token,
                     event_id,
                     recipient,
                     referenced_ticket_id,
                     state,
                     created_at,
                     updated_at
-                ) VALUES (?, ?, ?, ?, 'IN_FLIGHT', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 'IN_FLIGHT', ?, ?)
                 """,
                 (
-                    int(audit_log_id),
+                    row_id,
+                    token or "",
                     str(event_id),
                     recipient,
                     referenced_ticket_id,
@@ -287,7 +401,7 @@ class Database:
         with self._lock:
             cursor = self._conn.cursor()
             cursor.execute(
-                "SELECT id, status, updated_at FROM audit_logs WHERE status IN ('PENDING', 'DISPATCHING')"
+                "SELECT id, status, lease_token, updated_at FROM audit_logs WHERE status IN ('PENDING', 'DISPATCHING')"
             )
             rows = cursor.fetchall()
             for row in rows:
@@ -301,24 +415,25 @@ class Database:
                         """
                         UPDATE audit_logs
                         SET status = 'ESCALATED',
+                            lease_token = ?,
                             priority = 'HIGH',
                             assigned_queue = 'dlq_reconciliation',
                             sla_hours = 1,
                             escalate_to_human = 1,
                             error_detail = ?,
                             updated_at = ?
-                        WHERE id = ?
+                        WHERE id = ? AND lease_token = ?
                         """,
-                        (reason, now_iso, int(row["id"])),
+                        (uuid4().hex, reason, now_iso, int(row["id"]), row["lease_token"]),
                     )
-                    swept += 1
+                    swept += cursor.rowcount
             if swept > 0:
                 self._conn.commit()
         return swept
 
     def finalize_dispatch(
         self,
-        audit_log_id: int,
+        audit_log_id: int | LeaseReservation,
         *,
         data: CleanedPayload,
         rules: RuleEvaluationResult,
@@ -326,46 +441,86 @@ class Database:
         draft: Optional[DraftOutput],
         escalate_to_human: bool,
         tokens_used: int,
+        lease_token: Optional[str] = None,
     ) -> int:
-        """Update a reserved `PENDING`/`DISPATCHING` audit row to its terminal status."""
+        """Compare-and-swap a reserved `PENDING`/`DISPATCHING` row to its terminal status using `lease_token`."""
+        row_id, token = _extract_id_and_token(audit_log_id, lease_token)
         draft_serialized: Optional[str] = (
             json.dumps(draft.model_dump(mode="json")) if draft is not None else None
         )
         now_iso = datetime.now(timezone.utc).isoformat()
         with self._lock:
             cursor = self._conn.cursor()
-            cursor.execute(
-                """
-                UPDATE audit_logs
-                SET sender = ?,
-                    clean_subject = ?,
-                    status = ?,
-                    priority = ?,
-                    assigned_queue = ?,
-                    sla_hours = ?,
-                    escalate_to_human = ?,
-                    tokens_used = ?,
-                    draft_json = ?,
-                    error_detail = NULL,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    data.sender,
-                    data.clean_subject,
-                    status.value,
-                    rules.priority.value,
-                    rules.assigned_queue,
-                    int(rules.sla_hours),
-                    1 if escalate_to_human else 0,
-                    int(tokens_used),
-                    draft_serialized,
-                    now_iso,
-                    int(audit_log_id),
-                ),
-            )
+            if token is not None:
+                cursor.execute(
+                    """
+                    UPDATE audit_logs
+                    SET sender = ?,
+                        clean_subject = ?,
+                        status = ?,
+                        priority = ?,
+                        assigned_queue = ?,
+                        sla_hours = ?,
+                        escalate_to_human = ?,
+                        tokens_used = ?,
+                        draft_json = ?,
+                        error_detail = NULL,
+                        updated_at = ?
+                    WHERE id = ? AND lease_token = ? AND status IN ('PENDING', 'DISPATCHING')
+                    """,
+                    (
+                        data.sender,
+                        data.clean_subject,
+                        status.value,
+                        rules.priority.value,
+                        rules.assigned_queue,
+                        int(rules.sla_hours),
+                        1 if escalate_to_human else 0,
+                        int(tokens_used),
+                        draft_serialized,
+                        now_iso,
+                        row_id,
+                        token,
+                    ),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE audit_logs
+                    SET sender = ?,
+                        clean_subject = ?,
+                        status = ?,
+                        priority = ?,
+                        assigned_queue = ?,
+                        sla_hours = ?,
+                        escalate_to_human = ?,
+                        tokens_used = ?,
+                        draft_json = ?,
+                        error_detail = NULL,
+                        updated_at = ?
+                    WHERE id = ? AND status IN ('PENDING', 'DISPATCHING')
+                    """,
+                    (
+                        data.sender,
+                        data.clean_subject,
+                        status.value,
+                        rules.priority.value,
+                        rules.assigned_queue,
+                        int(rules.sla_hours),
+                        1 if escalate_to_human else 0,
+                        int(tokens_used),
+                        draft_serialized,
+                        now_iso,
+                        row_id,
+                    ),
+                )
+            if cursor.rowcount == 0:
+                self._conn.rollback()
+                raise StaleLeaseError(
+                    f"Stale lease token when finalizing audit_log_id={row_id}; state was superseded."
+                )
             self._conn.commit()
-            return int(audit_log_id)
+            return row_id
 
     def record_dispatch(
         self,
@@ -376,10 +531,11 @@ class Database:
         draft: Optional[DraftOutput],
         escalate_to_human: bool,
         tokens_used: int,
-        reserved_log_id: Optional[int] = None,
+        reserved_log_id: Optional[int | LeaseReservation] = None,
+        lease_token: Optional[str] = None,
     ) -> int:
         """Reserve (if not already reserved) and finalize the pipeline execution trace."""
-        log_id = (
+        reservation = (
             reserved_log_id
             if reserved_log_id is not None
             else self.reserve_event(
@@ -389,13 +545,14 @@ class Database:
             )
         )
         return self.finalize_dispatch(
-            log_id,
+            reservation,
             data=data,
             rules=rules,
             status=status,
             draft=draft,
             escalate_to_human=escalate_to_human,
             tokens_used=tokens_used,
+            lease_token=lease_token,
         )
 
     def get_audit_log(self, audit_log_id: int) -> Optional[Dict[str, Any]]:

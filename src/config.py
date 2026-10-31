@@ -26,8 +26,9 @@ class EngineConfig:
         default_factory=lambda: int(os.environ.get("TM_MAX_TIMESTAMP_SKEW_SECONDS", "300"))
     )
     max_future_skew_seconds: int = 60
+    # Default 180s lease (3x worst-case 4 * 15s = 60s SLM timeout budget across Steps 3 & 5)
     pending_lease_seconds: float = field(
-        default_factory=lambda: float(os.environ.get("TM_PENDING_LEASE_SECONDS", "120.0"))
+        default_factory=lambda: float(os.environ.get("TM_PENDING_LEASE_SECONDS", "180.0"))
     )
     max_clean_body_chars: int = 2000
 
