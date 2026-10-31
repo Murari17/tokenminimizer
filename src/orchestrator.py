@@ -1,5 +1,6 @@
-"""Main deterministic state machine connecting Steps 1 through 6 with atomic reservation
-replay protection and context-isolated per-event token accounting.
+"""Main deterministic state machine connecting Steps 1 through 6 with atomic reservation,
+mid-pipeline failure recovery (`FAILED` state + retry reclamation), lease expiration,
+and context-isolated per-event token accounting.
 """
 
 from __future__ import annotations
@@ -36,7 +37,6 @@ class WorkflowOrchestrator:
         self.config = config
         self.slm_client = slm_client or LocalSLMClient(config=config)
         self.db = db or Database(db_path=config.sqlite_db_path)
-        # Each orchestrator gets its own bounded outbox instance unless a custom transport is wired
         self.transport: DispatchTransport = (
             transport if transport is not None else InMemoryOutboxTransport(max_items=1000)
         )
@@ -46,7 +46,7 @@ class WorkflowOrchestrator:
         raw_dict: Dict[str, Any],
         secret_key: Optional[str] = None,
     ) -> DispatchReceipt:
-        """Execute the 6-stage workflow with atomic `PENDING` reservation before SLM or dispatch."""
+        """Execute the 6-stage workflow with lease-backed `PENDING` reservation and failure recovery."""
         effective_secret = self.config.resolve_webhook_secret(secret_key)
 
         with self.slm_client.track_scope_tokens() as scoped_tokens:
@@ -58,59 +58,69 @@ class WorkflowOrchestrator:
                 max_timestamp_skew_seconds=self.config.max_timestamp_skew_seconds,
             )
 
-            # Atomically reserve `event_id` with `status='PENDING'` BEFORE spending any SLM tokens
-            # or dispatching any messages. Concurrent duplicate submissions fail right here!
+            # Atomically reserve `event_id` with `status='PENDING'` (or reclaim if a prior attempt
+            # failed mid-pipeline or its PENDING lease expired).
             try:
                 reserved_log_id = self.db.reserve_event(
                     event_id=raw_payload.event_id,
                     sender=raw_payload.sender,
                     clean_subject=raw_payload.raw_subject[:500],
+                    lease_seconds=self.config.pending_lease_seconds,
                 )
             except DuplicateEventError as exc:
                 raise ReplayAttackError(str(exc)) from exc
 
-            # Step 2 [CODE - 0 Tokens]: Strip HTML, normalize Unicode, extract URLs, scan for injection
-            cleaned_payload = fetch_and_clean(
-                payload=raw_payload,
-                max_body_chars=self.config.max_clean_body_chars,
-            )
+            try:
+                # Step 2 [CODE - 0 Tokens]: Strip HTML, normalize Unicode, extract URLs, scan for injection
+                cleaned_payload = fetch_and_clean(
+                    payload=raw_payload,
+                    max_body_chars=self.config.max_clean_body_chars,
+                )
 
-            # Step 3 [SMALL LLM - Minimal Cost]: Classify intent & urgency (short-circuits on suspicious/empty)
-            classification = read_and_classify(
-                data=cleaned_payload,
-                slm_client=self.slm_client,
-                model=self.config.classify_model,
-            )
+                # Step 3 [SMALL LLM - Minimal Cost]: Classify intent & urgency
+                classification = read_and_classify(
+                    data=cleaned_payload,
+                    slm_client=self.slm_client,
+                    model=self.config.classify_model,
+                )
 
-            # Step 4 [CODE - 0 Tokens]: Apply deterministic routing, SLA, priority, and tone matrix
-            rule_result = apply_rules(
-                data=cleaned_payload,
-                cls=classification,
-            )
+                # Step 4 [CODE - 0 Tokens]: Apply deterministic routing, SLA, priority, and tone matrix
+                rule_result = apply_rules(
+                    data=cleaned_payload,
+                    cls=classification,
+                )
 
-            # Step 5 [SMALL LLM - Minimal Cost]: Draft constrained reply (skipped if should_draft_reply=False)
-            draft = draft_response(
-                data=cleaned_payload,
-                rules=rule_result,
-                slm_client=self.slm_client,
-                model=self.config.draft_model,
-            )
+                # Step 5 [SMALL LLM - Minimal Cost]: Draft constrained reply
+                draft = draft_response(
+                    data=cleaned_payload,
+                    rules=rule_result,
+                    slm_client=self.slm_client,
+                    model=self.config.draft_model,
+                )
 
-            # Exact context-isolated tokens consumed by this event only
-            run_tokens_used = scoped_tokens[0] + scoped_tokens[1]
+                # Exact context-isolated tokens consumed by this event only
+                run_tokens_used = scoped_tokens[0] + scoped_tokens[1]
 
-            # Step 6 [CODE - 0 Tokens]: Run output guardrails, dispatch via transport, update PENDING -> final status
-            receipt = validate_save_send(
-                data=cleaned_payload,
-                rules=rule_result,
-                draft=draft,
-                db=self.db,
-                tokens_used=run_tokens_used,
-                allowed_domains=self.config.allowed_domains,
-                transport=self.transport,
-                reserved_log_id=reserved_log_id,
-            )
-            return receipt
+                # Step 6 [CODE - 0 Tokens]: Validate guardrails, log pre-send reconciliation, send, finalize
+                receipt = validate_save_send(
+                    data=cleaned_payload,
+                    rules=rule_result,
+                    draft=draft,
+                    db=self.db,
+                    tokens_used=run_tokens_used,
+                    allowed_domains=self.config.allowed_domains,
+                    transport=self.transport,
+                    reserved_log_id=reserved_log_id,
+                )
+                return receipt
+            except Exception as exc:
+                run_tokens_used = scoped_tokens[0] + scoped_tokens[1]
+                self.db.mark_failed(
+                    reserved_log_id,
+                    error_detail=f"{type(exc).__name__}: {exc}",
+                    tokens_used=run_tokens_used,
+                )
+                raise
 
 
 def run_pipeline(

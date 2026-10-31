@@ -26,6 +26,9 @@ class EngineConfig:
         default_factory=lambda: int(os.environ.get("TM_MAX_TIMESTAMP_SKEW_SECONDS", "300"))
     )
     max_future_skew_seconds: int = 60
+    pending_lease_seconds: float = field(
+        default_factory=lambda: float(os.environ.get("TM_PENDING_LEASE_SECONDS", "120.0"))
+    )
     max_clean_body_chars: int = 2000
 
     # Local SLM HTTP endpoint settings (Ollama / vLLM compatible)

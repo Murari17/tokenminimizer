@@ -1,13 +1,16 @@
 """End-to-end 6-stage integration tests, concurrent duplicate-send prevention,
-concurrency token isolation, classifier evaluation benchmark, and debugger gate verification.
+mid-pipeline failure recovery + retry reclamation, stale PENDING lease sweep,
+at-most-once reconciliation logging, and classifier evaluation verification.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List
+from uuid import uuid4
 
 import pytest
 
@@ -15,6 +18,7 @@ from scripts.debug_on_fail import build_debug_bundle, extract_failing_tests, ext
 from scripts.eval_classifier import evaluate_dataset
 from src.config import EngineConfig
 from src.database import Database, DuplicateEventError
+import src.orchestrator as orchestrator_mod
 from src.orchestrator import WorkflowOrchestrator
 from src.pipeline.step1_trigger import ReplayAttackError
 from src.pipeline.step6_validate import InMemoryOutboxTransport
@@ -135,8 +139,6 @@ def test_e2e_same_signed_event_from_5_concurrent_threads_dispatches_only_once(
         raw_subject="Concurrent webhook retry test",
         raw_body="Please check invoice INV-555.",
     )
-    # Queue only 1 classification + 1 draft response: if a second thread leaked through to SLM or send,
-    # MockOllamaController would fail or outbox would have >1 message.
     mock_ollama.queue_ollama_json(
         {
             "intent": "BILLING",
@@ -189,6 +191,160 @@ def test_e2e_same_signed_event_from_5_concurrent_threads_dispatches_only_once(
     assert len(duplicates) == 4
     assert len(outbox.sent_messages) == 1
     assert memory_db.count_logs() == 1
+
+
+def test_e2e_mid_pipeline_exception_marks_failed_and_allows_retry_to_succeed(
+    make_signed_trigger,
+    secret_key: str,
+    slm_client: LocalSLMClient,
+    mock_ollama: MockOllamaController,
+    memory_db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for stuck-PENDING bug:
+    1. Force an unhandled exception mid-pipeline after `reserve_event`.
+    2. Verify row is finalized as `FAILED` (escalated to `dlq_human_recovery`), not left `PENDING`.
+    3. Retry the exact same signed payload and verify it reclaims the `FAILED` row and succeeds to `SENT`.
+    """
+    outbox = InMemoryOutboxTransport()
+    raw = make_signed_trigger(
+        sender="retry.customer@enterprise.io",
+        raw_subject="Invoice retry test",
+        raw_body="Please check invoice INV-909.",
+    )
+
+    orchestrator = WorkflowOrchestrator(
+        config=EngineConfig(webhook_secret=secret_key),
+        slm_client=slm_client,
+        db=memory_db,
+        transport=outbox,
+    )
+
+    original_draft_response = orchestrator_mod.draft_response
+    call_count = {"n": 0}
+
+    def _flaky_draft_response(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("Simulated mid-pipeline OOM / unhandled error in Step 5")
+        return original_draft_response(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator_mod, "draft_response", _flaky_draft_response)
+
+    # Attempt 1: Classification succeeds, then Step 5 raises unhandled RuntimeError
+    mock_ollama.queue_ollama_json(
+        {
+            "intent": "BILLING",
+            "confidence": 0.93,
+            "detected_entities": ["INV-909"],
+            "requires_human_review": False,
+        },
+        prompt_eval_count=45,
+        eval_count=20,
+    )
+    with pytest.raises(RuntimeError, match="Simulated mid-pipeline OOM"):
+        orchestrator.process_event(raw)
+
+    # Verify the row is NOT stuck in PENDING — it is marked FAILED and escalated to dlq_human_recovery
+    logs = memory_db.get_logs_by_event_id(raw["event_id"])
+    assert len(logs) == 1
+    assert logs[0]["status"] == "FAILED"
+    assert logs[0]["assigned_queue"] == "dlq_human_recovery"
+    assert logs[0]["escalate_to_human"] == 1
+    assert "Simulated mid-pipeline OOM" in logs[0]["error_detail"]
+    assert len(outbox.sent_messages) == 0
+
+    # Attempt 2 (Sender retries the exact same signed event): reclaims the FAILED row and succeeds!
+    mock_ollama.queue_ollama_json(
+        {
+            "intent": "BILLING",
+            "confidence": 0.93,
+            "detected_entities": ["INV-909"],
+            "requires_human_review": False,
+        },
+        prompt_eval_count=45,
+        eval_count=20,
+    )
+    mock_ollama.queue_ollama_json(
+        {
+            "subject_line": "Re: Invoice retry test [TKT-909]",
+            "body_text": "We have logged your inquiry for INV-909 under TKT-909.",
+            "referenced_ticket_id": "TKT-909",
+        },
+        prompt_eval_count=55,
+        eval_count=30,
+    )
+
+    retry_receipt = orchestrator.process_event(raw)
+    assert retry_receipt.status == DispatchStatus.SENT
+    assert len(outbox.sent_messages) == 1
+    assert memory_db.count_logs() == 1
+
+    updated_log = memory_db.get_audit_log(retry_receipt.audit_log_id)
+    assert updated_log is not None
+    assert updated_log["status"] == "SENT"
+    assert updated_log["error_detail"] is None
+
+    # Verify reconciliation log was recorded and marked DELIVERED
+    rec_logs = memory_db.get_reconciliation_logs(raw["event_id"])
+    assert len(rec_logs) == 1
+    assert rec_logs[0]["state"] == "DELIVERED"
+
+    # Attempt 3 (Replay after SENT): now rejected as a replay!
+    with pytest.raises(ReplayAttackError, match="Replay detected"):
+        orchestrator.process_event(raw)
+
+
+def test_e2e_stale_pending_lease_reclaim_and_background_sweeper(
+    memory_db: Database,
+) -> None:
+    """Verify hard-crash recovery:
+    1. A `PENDING` row from a hard crash (that skipped `except`) cannot be reclaimed before lease expiry.
+    2. Once `lease_seconds` elapses, `reserve_event` reclaims it cleanly.
+    3. `sweep_stale_pending` transitions unretried stale `PENDING`/`DISPATCHING` rows to `ESCALATED`.
+    """
+    t0 = datetime.now(timezone.utc)
+    crashed_event_id = uuid4()
+
+    row_id = memory_db.reserve_event(
+        event_id=crashed_event_id,
+        sender="crash@client.org",
+        clean_subject="Hard crash test",
+        lease_seconds=60.0,
+        now=t0,
+    )
+
+    # 10 seconds later (lease not yet expired): duplicate attempt is rejected
+    with pytest.raises(DuplicateEventError):
+        memory_db.reserve_event(
+            event_id=crashed_event_id,
+            sender="crash@client.org",
+            clean_subject="Hard crash test",
+            lease_seconds=60.0,
+            now=t0 + timedelta(seconds=10),
+        )
+
+    # 65 seconds later (lease expired): retry reclaims the same row ID!
+    reclaimed_id = memory_db.reserve_event(
+        event_id=crashed_event_id,
+        sender="crash@client.org",
+        clean_subject="Hard crash test",
+        lease_seconds=60.0,
+        now=t0 + timedelta(seconds=65),
+    )
+    assert reclaimed_id == row_id
+
+    # If still unfinalized after another 70s, background sweeper transitions it to ESCALATED
+    swept_count = memory_db.sweep_stale_pending(
+        lease_seconds=60.0,
+        now=t0 + timedelta(seconds=140),
+    )
+    assert swept_count == 1
+    swept_row = memory_db.get_audit_log(row_id)
+    assert swept_row is not None
+    assert swept_row["status"] == "ESCALATED"
+    assert swept_row["assigned_queue"] == "dlq_reconciliation"
+    assert swept_row["escalate_to_human"] == 1
 
 
 def test_e2e_critical_security_report_escalates_without_drafting(

@@ -1,5 +1,5 @@
 """Stage 6 [CODE — 0 Tokens]: Output guardrails, PII leak check, atomic SQLite reservation
-before dispatch (preventing concurrent duplicate sends), and outbound delivery transport.
+before dispatch, pre-send reconciliation logging, and outbound delivery transport.
 """
 
 from __future__ import annotations
@@ -125,14 +125,7 @@ def is_draft_safe(
     draft: DraftOutput,
     allowed_domains: Iterable[str] = DEFAULT_CONFIG.allowed_domains,
 ) -> bool:
-    """Run deterministic security and policy guardrails on an outbound draft.
-
-    Rejects if `subject_line` or `body_text` contains:
-    - Leaked PII/secrets (Luhn-valid credit card numbers, SSNs with/without dashes, API keys, private IPs)
-    - Forbidden commitment phrases ("100% money-back guarantee", "we will sue", "accept liability", etc.)
-    - URLs (including uppercase HTTP://, hxxps://, protocol-relative //, www., or bare domains) not on allowlist
-    - Unescaped HTML / script tags
-    """
+    """Run deterministic security and policy guardrails on an outbound draft."""
     combined = f"{draft.subject_line}\n{draft.body_text}"
     if contains_pii_or_secrets(combined):
         return False
@@ -155,13 +148,7 @@ def validate_save_send(
     transport: Optional[DispatchTransport] = None,
     reserved_log_id: Optional[int] = None,
 ) -> DispatchReceipt:
-    """Atomically reserve `event_id` (`status='PENDING'`), validate and send draft, then finalize to `SENT`.
-
-    Reserving the row in SQLite *before* calling `active_transport.send()` eliminates the
-    check-then-act race condition under concurrent webhook retries: only the single thread
-    that wins the `INSERT ... status='PENDING'` reservation ever calls `transport.send()`.
-    """
-    # 1. Atomically reserve the event_id in SQLite BEFORE any transport dispatch
+    """Atomically reserve `event_id`, log pre-send reconciliation, send, and finalize to `SENT`."""
     audit_log_id = (
         reserved_log_id
         if reserved_log_id is not None
@@ -172,47 +159,59 @@ def validate_save_send(
         )
     )
 
-    active_transport = transport if transport is not None else InMemoryOutboxTransport(max_items=100)
-    escalate_to_human = rules.escalate_to_human
-    final_payload: Optional[DraftOutput] = None
+    try:
+        active_transport = (
+            transport if transport is not None else InMemoryOutboxTransport(max_items=100)
+        )
+        escalate_to_human = rules.escalate_to_human
+        final_payload: Optional[DraftOutput] = None
 
-    # 2. Validate guardrails and dispatch ONLY after reservation succeeded
-    if draft is None:
-        if rules.assigned_queue == "trash" and not rules.escalate_to_human:
-            status = DispatchStatus.DROPPED_SPAM
-        else:
-            status = DispatchStatus.ESCALATED
-            escalate_to_human = True
-    else:
-        if is_draft_safe(draft, allowed_domains=allowed_domains):
-            try:
-                active_transport.send(data, draft)
-                status = DispatchStatus.SENT
-                final_payload = draft
-            except Exception:
+        if draft is None:
+            if rules.assigned_queue == "trash" and not rules.escalate_to_human:
+                status = DispatchStatus.DROPPED_SPAM
+            else:
                 status = DispatchStatus.ESCALATED
                 escalate_to_human = True
-                final_payload = None
         else:
-            status = DispatchStatus.BLOCKED_VALIDATION
-            escalate_to_human = True
-            final_payload = None
+            if is_draft_safe(draft, allowed_domains=allowed_domains):
+                rec_id = db.begin_dispatch_reconciliation(
+                    audit_log_id=audit_log_id,
+                    event_id=data.event_id,
+                    recipient=data.sender,
+                    referenced_ticket_id=draft.referenced_ticket_id,
+                )
+                try:
+                    active_transport.send(data, draft)
+                    db.complete_dispatch_reconciliation(rec_id, state="DELIVERED")
+                    status = DispatchStatus.SENT
+                    final_payload = draft
+                except Exception:
+                    db.complete_dispatch_reconciliation(rec_id, state="SEND_ERROR")
+                    status = DispatchStatus.ESCALATED
+                    escalate_to_human = True
+                    final_payload = None
+            else:
+                status = DispatchStatus.BLOCKED_VALIDATION
+                escalate_to_human = True
+                final_payload = None
 
-    # 3. Update the reserved `PENDING` row to its terminal status
-    db.finalize_dispatch(
-        audit_log_id,
-        data=data,
-        rules=rules,
-        status=status,
-        draft=final_payload,
-        escalate_to_human=escalate_to_human,
-        tokens_used=tokens_used,
-    )
+        db.finalize_dispatch(
+            audit_log_id,
+            data=data,
+            rules=rules,
+            status=status,
+            draft=final_payload,
+            escalate_to_human=escalate_to_human,
+            tokens_used=tokens_used,
+        )
 
-    return DispatchReceipt(
-        event_id=data.event_id,
-        status=status,
-        final_payload=final_payload,
-        audit_log_id=audit_log_id,
-        tokens_used=tokens_used,
-    )
+        return DispatchReceipt(
+            event_id=data.event_id,
+            status=status,
+            final_payload=final_payload,
+            audit_log_id=audit_log_id,
+            tokens_used=tokens_used,
+        )
+    except Exception as exc:
+        db.mark_failed(audit_log_id, error_detail=str(exc), tokens_used=tokens_used)
+        raise
