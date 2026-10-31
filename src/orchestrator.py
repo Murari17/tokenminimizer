@@ -1,6 +1,6 @@
 """Main deterministic state machine connecting Steps 1 through 6 with fencing-token (`lease_token`)
-compare-and-swap, automatic stale-lease sweeping, mid-pipeline heartbeat, and context-isolated
-per-event token accounting.
+compare-and-swap, automatic stale-lease sweeping, inter-step heartbeats after both Step 3 and Step 5,
+and context-isolated per-event token accounting.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from src.pipeline.step5_draft import draft_response
 from src.pipeline.step6_validate import (
     DispatchTransport,
     InMemoryOutboxTransport,
+    WebhookDispatchTransport,
     validate_save_send,
 )
 from src.schemas import DispatchReceipt
@@ -37,10 +38,17 @@ class WorkflowOrchestrator:
         self.config = config
         self.slm_client = slm_client or LocalSLMClient(config=config)
         self.db = db or Database(db_path=config.sqlite_db_path)
-        self.transport: DispatchTransport = (
-            transport if transport is not None else InMemoryOutboxTransport(max_items=1000)
-        )
-        # Sweep any orphaned PENDING/DISPATCHING rows left by prior process crashes on startup
+        if transport is not None:
+            self.transport: DispatchTransport = transport
+        elif config.dispatch_webhook_url.strip():
+            self.transport = WebhookDispatchTransport(
+                webhook_url=config.dispatch_webhook_url.strip(),
+                timeout_seconds=config.http_timeout_seconds,
+            )
+        else:
+            self.transport = InMemoryOutboxTransport(max_items=1000)
+
+        # Sweep orphaned PENDING (-> FAILED, reclaimable) and DISPATCHING (-> ESCALATED) leases on startup
         self.db.sweep_stale_pending(lease_seconds=self.config.pending_lease_seconds)
 
     def process_event(
@@ -61,7 +69,7 @@ class WorkflowOrchestrator:
             )
 
             # Atomically reserve `event_id` with a unique `lease_token` (or reclaim if a prior
-            # attempt failed mid-pipeline or its PENDING lease expired).
+            # attempt failed mid-pipeline, was swept from PENDING to FAILED, or its lease expired).
             try:
                 reservation = self.db.reserve_event(
                     event_id=raw_payload.event_id,
@@ -105,6 +113,12 @@ class WorkflowOrchestrator:
                     slm_client=self.slm_client,
                     model=self.config.draft_model,
                 )
+
+                # Heartbeat lease after Step 5 SLM call; abort immediately if lease was lost
+                if not self.db.heartbeat_lease(reservation):
+                    raise StaleLeaseError(
+                        f"Lease superseded after Step 5 for event_id={raw_payload.event_id}; aborting stale worker."
+                    )
 
                 # Exact context-isolated tokens consumed by this event only
                 run_tokens_used = scoped_tokens[0] + scoped_tokens[1]

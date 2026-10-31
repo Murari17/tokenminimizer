@@ -6,12 +6,13 @@ from __future__ import annotations
 
 import contextvars
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, List, Optional, Type, TypeVar
+from typing import Any, Dict, Iterator, List, Optional, Type, TypeVar
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ValidationError
@@ -23,6 +24,105 @@ T = TypeVar("T", bound=BaseModel)
 _SCOPED_TOKEN_ACCUMULATOR: contextvars.ContextVar[Optional[List[int]]] = contextvars.ContextVar(
     "_SCOPED_TOKEN_ACCUMULATOR", default=None
 )
+
+_THINK_BLOCK_RE = re.compile(
+    r"<(?:think|thought|reasoning)>.*?(?:</(?:think|thought|reasoning)>|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
+
+
+def flatten_json_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Inline all Pydantic `$defs`/`$ref` references and strip metadata bloat for universal
+    compatibility across Ollama, llama.cpp, vLLM, and LM Studio GBNF grammar engines.
+    """
+    defs = schema.get("$defs", {})
+
+    def _resolve(node: Any) -> Any:
+        if isinstance(node, dict):
+            if "$ref" in node:
+                ref_path = node["$ref"]
+                ref_name = ref_path.split("/")[-1]
+                if ref_name in defs:
+                    resolved = dict(defs[ref_name])
+                    for k, v in node.items():
+                        if k != "$ref":
+                            resolved[k] = v
+                    return _resolve(resolved)
+            cleaned: Dict[str, Any] = {}
+            for k, v in node.items():
+                if k in ("$defs", "title"):
+                    continue
+                cleaned[k] = _resolve(v)
+            if cleaned.get("type") == "object" and "properties" in cleaned:
+                # Ensure all properties are listed in `required` so GBNF grammars emit every key in order
+                cleaned["required"] = list(cleaned["properties"].keys())
+            return cleaned
+        if isinstance(node, list):
+            return [_resolve(item) for item in node]
+        return node
+
+    return _resolve(schema)
+
+
+def extract_and_repair_json(raw_text: str) -> Dict[str, Any]:
+    """Universally extract and parse a JSON object from any local SLM response.
+
+    Handles:
+    1. Direct valid JSON objects.
+    2. Reasoning models emitting `<think>...</think>` or `<thought>...</thought>` prefixes.
+    3. Markdown code blocks (` ```json ... ``` `).
+    4. Truncated trailing array elements (e.g., if `num_predict` cuts off inside `detected_entities`
+       after the required scalar routing fields were already emitted).
+    """
+    text = raw_text.strip()
+    if not text:
+        raise ValueError("Empty SLM response text.")
+
+    # Fast path: strict JSON object
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Strip thinking blocks and markdown code fences
+    cleaned = _THINK_BLOCK_RE.sub("", text).strip()
+    fence_match = _CODE_FENCE_RE.search(cleaned)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+
+    # Locate first '{'
+    start_idx = cleaned.find("{")
+    if start_idx == -1:
+        raise ValueError(f"No JSON object start '{{' found in SLM response: {text[:120]!r}")
+
+    candidate = cleaned[start_idx:]
+    end_idx = candidate.rfind("}")
+    if end_idx != -1:
+        try:
+            parsed = json.loads(candidate[: end_idx + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Repair path: if truncated inside a trailing array/string (such as `detected_entities`),
+    # strip the incomplete tail back to the last complete key-value comma or opening bracket.
+    if '"detected_entities"' in candidate:
+        prefix, _, _ = candidate.partition('"detected_entities"')
+        prefix_clean = prefix.rstrip().rstrip(",")
+        repaired = prefix_clean + "}"
+        try:
+            parsed = json.loads(repaired)
+            if isinstance(parsed, dict):
+                parsed.setdefault("detected_entities", [])
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"Unable to parse or repair JSON from SLM output: {text[:160]!r}")
 
 
 class SLMClientError(RuntimeError):
@@ -161,8 +261,10 @@ class LocalSLMClient:
         num_predict: int = 128,
         temperature: float = 0.0,
     ) -> T:
-        """Invoke the local SLM with JSON schema enforcement, hard token caps, and self-correcting retry."""
-        json_schema = response_schema.model_json_schema()
+        """Invoke the local SLM with dereferenced JSON schema enforcement, thinking suppression,
+        hard token caps, universal JSON extraction/repair, and self-correcting retry.
+        """
+        json_schema = flatten_json_schema(response_schema.model_json_schema())
         attempts = self.max_retries + 1
         last_error: Optional[Exception] = None
         active_prompt = user_prompt
@@ -173,6 +275,7 @@ class LocalSLMClient:
                 "system": system_prompt,
                 "prompt": active_prompt,
                 "stream": False,
+                "think": False,
                 "format": json_schema,
                 "options": {
                     "temperature": float(temperature),
@@ -191,7 +294,7 @@ class LocalSLMClient:
                 if not isinstance(raw_content, str) or not raw_content.strip():
                     raise SLMClientError("Empty or missing 'response' field in SLM output.")
 
-                parsed_json = json.loads(raw_content)
+                parsed_json = extract_and_repair_json(raw_content)
                 return response_schema.model_validate(parsed_json)
             except SLMTransportError as exc:
                 last_error = exc
@@ -202,7 +305,8 @@ class LocalSLMClient:
                     active_prompt = (
                         f"{user_prompt}\n\n"
                         f"[SCHEMA VALIDATION CORRECTION: Your previous output was invalid "
-                        f"({err_summary}). Output ONLY valid JSON matching {response_schema.__name__}.]"
+                        f"({err_summary}). Output ONLY a compact JSON object matching {response_schema.__name__} "
+                        f"with no thinking, no markdown, and at most 2 short detected_entities.]"
                     )
 
         if isinstance(last_error, SLMTransportError):

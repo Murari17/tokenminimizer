@@ -5,10 +5,10 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import Any, List, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, UUID4, field_validator
+from pydantic import BaseModel, ConfigDict, Field, UUID4, field_validator, model_validator
 
 
 class SourceType(str, Enum):
@@ -107,15 +107,94 @@ class CleanedPayload(BaseModel):
         return value
 
 
+_INTENT_ALIASES = {
+    "BILLING": "BILLING",
+    "BILLING_INQUIRY": "BILLING",
+    "PAYMENT": "BILLING",
+    "REFUND": "BILLING",
+    "INVOICE": "BILLING",
+    "SUBSCRIPTION": "BILLING",
+    "TECHNICAL_SUPPORT": "TECHNICAL_SUPPORT",
+    "TECH_SUPPORT": "TECHNICAL_SUPPORT",
+    "TECHNICAL": "TECHNICAL_SUPPORT",
+    "SUPPORT": "TECHNICAL_SUPPORT",
+    "BUG": "TECHNICAL_SUPPORT",
+    "OUTAGE": "TECHNICAL_SUPPORT",
+    "SECURITY_REPORT": "SECURITY_REPORT",
+    "SECURITY": "SECURITY_REPORT",
+    "VULNERABILITY": "SECURITY_REPORT",
+    "ABUSE": "SECURITY_REPORT",
+    "FEATURE_REQUEST": "FEATURE_REQUEST",
+    "FEATURE": "FEATURE_REQUEST",
+    "FEEDBACK": "FEATURE_REQUEST",
+    "ENHANCEMENT": "FEATURE_REQUEST",
+    "SPAM": "SPAM",
+    "JUNK": "SPAM",
+    "PROMOTIONAL": "SPAM",
+    "MARKETING": "SPAM",
+}
+
+
 class ClassificationOutput(BaseModel):
-    """Stage 3 output contract (SLM Node 1): strict intent and urgency classification."""
+    """Stage 3 output contract (SLM Node 1): strict intent and urgency classification.
+
+    Note: Scalar routing fields (`intent`, `confidence`, `requires_human_review`) are
+    ordered BEFORE `detected_entities` so constrained decoding emits critical routing
+    decisions within the first ~25 tokens across all local SLM architectures.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     intent: IntentCategory
     confidence: float = Field(..., ge=0.0, le=1.0)
-    detected_entities: List[str] = Field(default_factory=list)
-    requires_human_review: bool
+    requires_human_review: bool = False
+    detected_entities: List[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_slm_output(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+
+        # Normalize intent casing, hyphens, spaces, and common SLM aliases
+        raw_intent = normalized.get("intent")
+        if isinstance(raw_intent, str):
+            cleaned_intent = re.sub(r"[\s\-]+", "_", raw_intent.strip().upper())
+            if cleaned_intent in _INTENT_ALIASES:
+                normalized["intent"] = _INTENT_ALIASES[cleaned_intent]
+
+        # Normalize confidence (handle string floats or 0-100 percentage outputs from some SLMs)
+        raw_conf = normalized.get("confidence")
+        if isinstance(raw_conf, (int, float, str)):
+            try:
+                conf_val = float(str(raw_conf).strip().rstrip("%"))
+                if 1.0 < conf_val <= 100.0:
+                    conf_val = conf_val / 100.0
+                normalized["confidence"] = max(0.0, min(1.0, round(conf_val, 4)))
+            except ValueError:
+                pass
+
+        # Ensure detected_entities is a list of strings even if null or single string
+        raw_entities = normalized.get("detected_entities")
+        if raw_entities is None:
+            normalized["detected_entities"] = []
+        elif isinstance(raw_entities, str):
+            normalized["detected_entities"] = [raw_entities] if raw_entities.strip() else []
+
+        # Default requires_human_review if omitted or coerced from string
+        raw_review = normalized.get("requires_human_review")
+        if raw_review is None:
+            conf_check = normalized.get("confidence")
+            intent_check = normalized.get("intent")
+            normalized["requires_human_review"] = bool(
+                intent_check == "SECURITY_REPORT"
+                or (isinstance(conf_check, (int, float)) and conf_check < 0.75)
+            )
+        elif isinstance(raw_review, str):
+            normalized["requires_human_review"] = raw_review.strip().lower() in ("true", "1", "yes")
+
+        return normalized
 
     @field_validator("detected_entities")
     @classmethod

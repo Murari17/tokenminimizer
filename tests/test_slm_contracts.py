@@ -43,12 +43,45 @@ def test_step3_valid_slm_classification_and_token_accounting(
     assert slm_client.total_completion_tokens == 28
     assert slm_client.total_tokens_used == 90
 
-    # Verify temperature=0.0, hard token cap, and randomized XML boundary tag in prompt
+    # Verify flattened schema ($defs/$ref inlined), thinking disabled, and field ordering
     sent_req = mock_ollama.requests[0]["payload"]
+    assert sent_req["think"] is False
+    assert "$defs" not in str(sent_req["format"])
+    assert "$ref" not in str(sent_req["format"])
+    assert list(sent_req["format"]["properties"].keys()) == [
+        "intent",
+        "confidence",
+        "requires_human_review",
+        "detected_entities",
+    ]
+
+    # Verify temperature=0.0, hard token cap, and randomized XML boundary tag in prompt
     assert sent_req["options"]["temperature"] == 0.0
     assert sent_req["options"]["num_predict"] == 128
     assert "<untrusted_input_" in sent_req["prompt"]
     assert "</untrusted_input_" in sent_req["prompt"]
+
+
+def test_step3_universal_slm_compatibility_thinking_tags_fences_truncation_and_aliases(
+    sample_cleaned_payload: CleanedPayload,
+    slm_client: LocalSLMClient,
+    mock_ollama: MockOllamaController,
+) -> None:
+    # Simulate a reasoning model emitting <think> tags, markdown fences, lowercase alias intent,
+    # percentage confidence, and getting truncated at num_predict inside detected_entities.
+    raw_verbose_output = (
+        "<think>The user is asking about an invoice charge.</think>\n"
+        "```json\n"
+        '{"intent": "billing inquiry", "confidence": "93%", "requires_human_review": "false", '
+        '"detected_entities": ["Pro plan", "unclosed_entity_due_to_token_cap'
+    )
+    mock_ollama.queue_ollama_json(raw_verbose_output, prompt_eval_count=70, eval_count=128)
+
+    result = read_and_classify(sample_cleaned_payload, slm_client)
+    assert result.intent == IntentCategory.BILLING
+    assert result.confidence == 0.93
+    assert result.requires_human_review is False
+    assert len(mock_ollama.requests) == 1
 
 
 def test_step3_short_circuits_with_zero_tokens_on_suspicious_payload(

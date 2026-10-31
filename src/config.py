@@ -52,9 +52,12 @@ class EngineConfig:
     )
     max_retries: int = 1
 
-    # Validation & Persistence
+    # Validation, Outbound Dispatch & Persistence
     sqlite_db_path: str = field(
         default_factory=lambda: os.environ.get("TM_SQLITE_DB_PATH", ":memory:")
+    )
+    dispatch_webhook_url: str = field(
+        default_factory=lambda: os.environ.get("TM_DISPATCH_WEBHOOK_URL", "")
     )
     allowed_domains: tuple[str, ...] = (
         "status.example.com",

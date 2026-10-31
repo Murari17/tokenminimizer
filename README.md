@@ -68,13 +68,13 @@ python3 -m venv .venv
 ```
 
 ### 3. Run the Classifier & Routing Evaluation Benchmark
-- **Offline deterministic guardrail & baseline check (30 stratified tickets):**
+- **Offline deterministic guardrail & baseline check (100 stratified tickets):**
   ```bash
   .venv/bin/python scripts/eval_classifier.py
   ```
-- **Live local Ollama SLM evaluation (measures per-class F1 and 10-bin ECE against Ollama):**
+- **Live local Ollama SLM evaluation (100 stratified tickets; see [`CALIBRATION_REPORT.md`](CALIBRATION_REPORT.md) — `100.0%` intent & routing accuracy, `0.0%` false silent-drop rate, `0.0395` SLM 10-bin ECE, `57.9` avg completion tokens/ticket on `gemma4:e4b-it-qat`):**
   ```bash
-  .venv/bin/python scripts/eval_classifier.py --live-ollama
+  .venv/bin/python scripts/eval_classifier.py --live-ollama --model gemma4:e4b-it-qat --write-report CALIBRATION_REPORT.md
   ```
 
 ### 4. Run Exception-Driven Frontier Debugger Gate

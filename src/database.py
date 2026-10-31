@@ -1,6 +1,6 @@
-"""Thread-safe parameterized SQLite persistence layer with fencing-token (`lease_token`)
-compare-and-swap (CAS), lease heartbeats, stale `PENDING` reclamation, and pre-send
-reconciliation logging for strict at-most-once delivery.
+"""Thread-safe and multi-process-safe parameterized SQLite persistence layer with
+WAL mode, fencing-token (`lease_token`) compare-and-swap (CAS), lease heartbeats,
+self-healing stale `PENDING` reclamation, and pre-send reconciliation logging.
 """
 
 from __future__ import annotations
@@ -53,19 +53,22 @@ def _extract_id_and_token(
 
 
 class Database:
-    """Thread-safe SQLite persistence layer enforcing parameterized queries and fencing-token CAS."""
+    """Thread-safe and multi-process-safe SQLite persistence layer enforcing fencing-token CAS."""
 
     def __init__(self, db_path: str = ":memory:") -> None:
         self.db_path = db_path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=5.0)
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10.0)
         self._conn.row_factory = sqlite3.Row
         self._initialize_schema()
 
     def _initialize_schema(self) -> None:
         with self._lock:
             cursor = self._conn.cursor()
-            cursor.execute("PRAGMA busy_timeout = 5000")
+            cursor.execute("PRAGMA busy_timeout = 10000")
+            if self.db_path != ":memory:":
+                cursor.execute("PRAGMA journal_mode = WAL")
+                cursor.execute("PRAGMA synchronous = NORMAL")
             cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS audit_logs (
@@ -133,11 +136,7 @@ class Database:
         lease_seconds: float = DEFAULT_CONFIG.pending_lease_seconds,
         now: Optional[datetime] = None,
     ) -> LeaseReservation:
-        """Atomically reserve `event_id` with a fresh fencing `lease_token`, or reclaim if expired/FAILED.
-
-        Returns a `LeaseReservation(row_id, lease_token)` (which is an `int` subclass for full
-        backward compatibility while carrying `.lease_token` for compare-and-swap verification).
-        """
+        """Atomically reserve `event_id` with a fresh fencing `lease_token`, or reclaim if expired/FAILED."""
         reference_now = now or datetime.now(timezone.utc)
         now_iso = reference_now.isoformat()
         event_id_str = str(event_id)
@@ -176,7 +175,7 @@ class Database:
             except sqlite3.IntegrityError as exc:
                 self._conn.rollback()
                 cursor.execute(
-                    "SELECT id, status, updated_at, attempt FROM audit_logs WHERE event_id = ? LIMIT 1",
+                    "SELECT id, status, lease_token, updated_at, attempt FROM audit_logs WHERE event_id = ? LIMIT 1",
                     (event_id_str,),
                 )
                 existing = cursor.fetchone()
@@ -208,7 +207,7 @@ class Database:
                                 draft_json = NULL,
                                 error_detail = NULL,
                                 updated_at = ?
-                            WHERE id = ? AND status = ? AND updated_at = ?
+                            WHERE id = ? AND status = ? AND lease_token = ?
                             """,
                             (
                                 new_token,
@@ -218,7 +217,7 @@ class Database:
                                 now_iso,
                                 int(existing["id"]),
                                 row_status,
-                                existing["updated_at"],
+                                existing["lease_token"],
                             ),
                         )
                         if cursor.rowcount == 1:
@@ -261,10 +260,7 @@ class Database:
         tokens_used: int = 0,
         lease_token: Optional[str] = None,
     ) -> bool:
-        """Transition a `PENDING` reservation to `FAILED` only if `lease_token` still matches.
-
-        Prevents a slow/stale worker whose lease expired from clobbering a newer worker's state.
-        """
+        """Transition a `PENDING` reservation to `FAILED` only if `lease_token` still matches."""
         row_id, token = _extract_id_and_token(audit_log_id, lease_token)
         now_iso = datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -312,11 +308,7 @@ class Database:
         referenced_ticket_id: str,
         lease_token: Optional[str] = None,
     ) -> int:
-        """Compare-and-swap `PENDING` -> `DISPATCHING` using `lease_token` before `transport.send()`.
-
-        If `rowcount == 0` (meaning the lease expired and was reclaimed by another worker or swept),
-        raises `StaleLeaseError` so the stale worker aborts BEFORE calling `transport.send()`.
-        """
+        """Compare-and-swap `PENDING` -> `DISPATCHING` using `lease_token` before `transport.send()`."""
         row_id, token = _extract_id_and_token(audit_log_id, lease_token)
         now_iso = datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -394,7 +386,16 @@ class Database:
         lease_seconds: float = DEFAULT_CONFIG.pending_lease_seconds,
         now: Optional[datetime] = None,
     ) -> int:
-        """Sweep stale `PENDING` or `DISPATCHING` rows older than `lease_seconds` to `ESCALATED`."""
+        """Sweep expired `PENDING` and `DISPATCHING` leases.
+
+        - Expired `PENDING` rows (where `send()` was never reached) transition to `FAILED`
+          (`assigned_queue='dlq_human_recovery'`, `escalate_to_human=1`). This alerts human
+          recovery AND keeps the row self-healing (reclaimable by `reserve_event` if the sender
+          retries after a restart).
+        - Expired `DISPATCHING` rows (where `send()` was in flight during a crash) transition
+          to terminal `ESCALATED` (`assigned_queue='dlq_reconciliation'`, `escalate_to_human=1`)
+          so they are never auto-resent, preserving strict at-most-once delivery.
+        """
         reference_now = now or datetime.now(timezone.utc)
         now_iso = reference_now.isoformat()
         swept = 0
@@ -406,25 +407,36 @@ class Database:
             rows = cursor.fetchall()
             for row in rows:
                 if self._is_lease_expired(row["updated_at"], lease_seconds=lease_seconds, now_dt=reference_now):
-                    reason = (
-                        "Stale DISPATCHING lease swept (at-most-once reconciliation required)"
-                        if row["status"] == "DISPATCHING"
-                        else "Stale PENDING lease swept to human recovery"
-                    )
+                    if row["status"] == "DISPATCHING":
+                        target_status = "ESCALATED"
+                        target_queue = "dlq_reconciliation"
+                        reason = "Stale DISPATCHING lease swept (at-most-once reconciliation required)"
+                    else:
+                        target_status = "FAILED"
+                        target_queue = "dlq_human_recovery"
+                        reason = "Stale PENDING lease swept to FAILED (reclaimable on retry)"
                     cursor.execute(
                         """
                         UPDATE audit_logs
-                        SET status = 'ESCALATED',
+                        SET status = ?,
                             lease_token = ?,
                             priority = 'HIGH',
-                            assigned_queue = 'dlq_reconciliation',
+                            assigned_queue = ?,
                             sla_hours = 1,
                             escalate_to_human = 1,
                             error_detail = ?,
                             updated_at = ?
                         WHERE id = ? AND lease_token = ?
                         """,
-                        (uuid4().hex, reason, now_iso, int(row["id"]), row["lease_token"]),
+                        (
+                            target_status,
+                            uuid4().hex,
+                            target_queue,
+                            reason,
+                            now_iso,
+                            int(row["id"]),
+                            row["lease_token"],
+                        ),
                     )
                     swept += cursor.rowcount
             if swept > 0:
