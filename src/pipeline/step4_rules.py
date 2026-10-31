@@ -55,33 +55,35 @@ def apply_rules(data: CleanedPayload, cls: ClassificationOutput) -> RuleEvaluati
        should_draft_reply=True, priority=LOW, sla_hours=48,
        allowed_tone="appreciative_brief", response_template_id="TPL_FEAT_01".
     """
-    # Branch 1: High-confidence SPAM with deterministic corroboration guard
-    if (
-        cls.intent == IntentCategory.SPAM
-        and cls.confidence >= 0.85
-        and not cls.requires_human_review
-        and not data.contains_suspicious_patterns
-    ):
-        if _has_transactional_customer_signals(data):
+    # Branch 1: SPAM handling — only silent-drop to `trash` when confidence >= 0.85,
+    # no human review flag, no suspicious patterns, and no transactional signals.
+    # Borderline SPAM (< 0.85 confidence or with transactional signals) routes to `spam_review`
+    # instead of falling through to auto-drafting.
+    if cls.intent == IntentCategory.SPAM and not data.contains_suspicious_patterns:
+        if (
+            cls.confidence >= 0.85
+            and not cls.requires_human_review
+            and not _has_transactional_customer_signals(data)
+        ):
             return RuleEvaluationResult(
                 event_id=data.event_id,
                 should_draft_reply=False,
-                escalate_to_human=True,
+                escalate_to_human=False,
                 priority=PriorityLevel.LOW,
-                sla_hours=24,
-                assigned_queue="spam_review",
+                sla_hours=0,
+                assigned_queue="trash",
                 response_template_id="TPL_NONE",
-                allowed_tone="strict_neutral",
+                allowed_tone="none",
             )
         return RuleEvaluationResult(
             event_id=data.event_id,
             should_draft_reply=False,
-            escalate_to_human=False,
+            escalate_to_human=True,
             priority=PriorityLevel.LOW,
-            sla_hours=0,
-            assigned_queue="trash",
+            sla_hours=24,
+            assigned_queue="spam_review",
             response_template_id="TPL_NONE",
-            allowed_tone="none",
+            allowed_tone="strict_neutral",
         )
 
     # Branch 2: Operational SLM timeout / empty input -> route to tier1_triage (MEDIUM, 8h SLA)

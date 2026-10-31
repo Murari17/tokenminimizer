@@ -109,7 +109,11 @@ class WebhookDispatchTransport:
         req = urllib.request.Request(
             url=self.webhook_url,
             data=payload_bytes,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Idempotency-Key": str(msg.event_id),
+                "X-Event-ID": str(msg.event_id),
+            },
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:

@@ -5,7 +5,8 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from enum import Enum
-from typing import Any, List, Optional
+import threading
+from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, UUID4, field_validator, model_validator
@@ -107,32 +108,48 @@ class CleanedPayload(BaseModel):
         return value
 
 
+_CANONICAL_INTENTS = {e.value for e in IntentCategory}
+
 _INTENT_ALIASES = {
-    "BILLING": "BILLING",
     "BILLING_INQUIRY": "BILLING",
     "PAYMENT": "BILLING",
     "REFUND": "BILLING",
     "INVOICE": "BILLING",
     "SUBSCRIPTION": "BILLING",
-    "TECHNICAL_SUPPORT": "TECHNICAL_SUPPORT",
     "TECH_SUPPORT": "TECHNICAL_SUPPORT",
     "TECHNICAL": "TECHNICAL_SUPPORT",
     "SUPPORT": "TECHNICAL_SUPPORT",
     "BUG": "TECHNICAL_SUPPORT",
     "OUTAGE": "TECHNICAL_SUPPORT",
-    "SECURITY_REPORT": "SECURITY_REPORT",
     "SECURITY": "SECURITY_REPORT",
     "VULNERABILITY": "SECURITY_REPORT",
     "ABUSE": "SECURITY_REPORT",
-    "FEATURE_REQUEST": "FEATURE_REQUEST",
     "FEATURE": "FEATURE_REQUEST",
     "FEEDBACK": "FEATURE_REQUEST",
     "ENHANCEMENT": "FEATURE_REQUEST",
-    "SPAM": "SPAM",
     "JUNK": "SPAM",
     "PROMOTIONAL": "SPAM",
     "MARKETING": "SPAM",
 }
+
+_TELEMETRY_LOCK = threading.Lock()
+_ALIAS_REMAP_COUNTS: Dict[str, int] = {}
+
+
+def get_alias_remap_telemetry() -> Dict[str, Any]:
+    """Return thread-safe telemetry of non-canonical intent label remaps (model drift indicator)."""
+    with _TELEMETRY_LOCK:
+        by_alias = dict(_ALIAS_REMAP_COUNTS)
+    return {
+        "total_alias_remaps": sum(by_alias.values()),
+        "by_alias": by_alias,
+    }
+
+
+def reset_alias_remap_telemetry() -> None:
+    """Reset the intent alias drift telemetry counters."""
+    with _TELEMETRY_LOCK:
+        _ALIAS_REMAP_COUNTS.clear()
 
 
 class ClassificationOutput(BaseModel):
@@ -157,23 +174,38 @@ class ClassificationOutput(BaseModel):
             return data
         normalized = dict(data)
 
-        # Normalize intent casing, hyphens, spaces, and common SLM aliases
+        # Normalize intent casing/separators; count non-canonical alias drift in telemetry
         raw_intent = normalized.get("intent")
         if isinstance(raw_intent, str):
             cleaned_intent = re.sub(r"[\s\-]+", "_", raw_intent.strip().upper())
-            if cleaned_intent in _INTENT_ALIASES:
-                normalized["intent"] = _INTENT_ALIASES[cleaned_intent]
+            if cleaned_intent in _CANONICAL_INTENTS:
+                normalized["intent"] = cleaned_intent
+            elif cleaned_intent in _INTENT_ALIASES:
+                mapped = _INTENT_ALIASES[cleaned_intent]
+                normalized["intent"] = mapped
+                with _TELEMETRY_LOCK:
+                    key = f"{cleaned_intent}->{mapped}"
+                    _ALIAS_REMAP_COUNTS[key] = _ALIAS_REMAP_COUNTS.get(key, 0) + 1
 
-        # Normalize confidence (handle string floats or 0-100 percentage outputs from some SLMs)
+        # Normalize confidence: ONLY rescale by /100 when an explicit '%' suffix is present.
+        # Out-of-range numeric values (e.g., 1.5 or -0.2) are NOT silently rescaled/clamped so
+        # Pydantic's Field(ge=0.0, le=1.0) rejects them as schema violations.
         raw_conf = normalized.get("confidence")
-        if isinstance(raw_conf, (int, float, str)):
-            try:
-                conf_val = float(str(raw_conf).strip().rstrip("%"))
-                if 1.0 < conf_val <= 100.0:
-                    conf_val = conf_val / 100.0
-                normalized["confidence"] = max(0.0, min(1.0, round(conf_val, 4)))
-            except ValueError:
-                pass
+        if isinstance(raw_conf, str):
+            stripped_conf = raw_conf.strip()
+            if stripped_conf.endswith("%"):
+                try:
+                    pct_val = float(stripped_conf[:-1].strip())
+                    normalized["confidence"] = round(pct_val / 100.0, 4)
+                except ValueError:
+                    pass
+            else:
+                try:
+                    normalized["confidence"] = round(float(stripped_conf), 4)
+                except ValueError:
+                    pass
+        elif isinstance(raw_conf, (int, float)) and not isinstance(raw_conf, bool):
+            normalized["confidence"] = round(float(raw_conf), 4)
 
         # Ensure detected_entities is a list of strings even if null or single string
         raw_entities = normalized.get("detected_entities")

@@ -69,6 +69,11 @@ def test_step3_universal_slm_compatibility_thinking_tags_fences_truncation_and_a
 ) -> None:
     # Simulate a reasoning model emitting <think> tags, markdown fences, lowercase alias intent,
     # percentage confidence, and getting truncated at num_predict inside detected_entities.
+    from pydantic import ValidationError
+    import pytest
+    from src.schemas import get_alias_remap_telemetry, reset_alias_remap_telemetry
+
+    reset_alias_remap_telemetry()
     raw_verbose_output = (
         "<think>The user is asking about an invoice charge.</think>\n"
         "```json\n"
@@ -82,6 +87,17 @@ def test_step3_universal_slm_compatibility_thinking_tags_fences_truncation_and_a
     assert result.confidence == 0.93
     assert result.requires_human_review is False
     assert len(mock_ollama.requests) == 1
+
+    # Verify alias drift was counted in telemetry
+    telemetry = get_alias_remap_telemetry()
+    assert telemetry["total_alias_remaps"] == 1
+    assert telemetry["by_alias"].get("BILLING_INQUIRY->BILLING") == 1
+
+    # Verify numeric confidence > 1.0 (e.g. 1.5 or 95 without '%') is rejected rather than divided by 100
+    with pytest.raises(ValidationError):
+        ClassificationOutput.model_validate({"intent": "BILLING", "confidence": 1.5})
+    with pytest.raises(ValidationError):
+        ClassificationOutput.model_validate({"intent": "BILLING", "confidence": 95})
 
 
 def test_step3_short_circuits_with_zero_tokens_on_suspicious_payload(

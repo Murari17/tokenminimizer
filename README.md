@@ -40,13 +40,13 @@ A production-grade, local-first **Token-Minimizing Workflow Engine** in Python b
 [Step 2: Clean & Normalize]  (CODE - 0 Tokens)              -> NFKC + Zero-Width Strip + Safe HTML Strip (<5 preserved) + Injection Scan
           │
           ▼
-[Step 3: SLM Classification] (SLM  - ≤128 Completion Toks)  -> qwen2.5:1.5b (~670 prompt tokens at 2,000-char cap; 0 tokens on suspicious/empty)
+[Step 3: SLM Classification] (SLM  - ≤128 Completion Toks)  -> gemma4:e4b-it-qat (0 tokens on suspicious/empty; ~46 avg completion tokens)
           │
           ▼
 [Step 4: Rules Engine]       (CODE - 0 Tokens)              -> Lease Heartbeat + Corroborated SPAM Gating + Timeout Triage + SLA Matrix
           │
           ▼
-[Step 5: SLM Reply Draft]    (SLM  - ≤200 Completion Toks)  -> llama3.2:3b (XML-bounded subject+body; 0 tokens on Spam/Escalation; static fallback)
+[Step 5: SLM Reply Draft]    (SLM  - ≤200 Completion Toks)  -> gemma4:e4b-it-qat (XML-bounded subject+body; 0 tokens on Spam/Escalation; static fallback)
           │
           ▼
 [Step 6: Validate & Dispatch](CODE - 0 Tokens)              -> Guardrails + CAS Lease-Token Check + Transport Send + Finalize SENT
@@ -67,14 +67,18 @@ python3 -m venv .venv
 .venv/bin/pytest -v
 ```
 
-### 3. Run the Classifier & Routing Evaluation Benchmark
-- **Offline deterministic guardrail & baseline check (100 stratified tickets):**
+### 3. Run the Classifier & Routing Evaluation Benchmark (`N=300` Tickets)
+- **Replay committed raw SLM predictions offline without needing Ollama (`N=300`: `100` calibration + `200` held-out test split; reproduces [`CALIBRATION_REPORT.md`](CALIBRATION_REPORT.md) from [`tests/eval_predictions.jsonl`](tests/eval_predictions.jsonl) in `<0.2s`):**
+  ```bash
+  .venv/bin/python scripts/eval_classifier.py --from-predictions tests/eval_predictions.jsonl --write-report CALIBRATION_REPORT.md
+  ```
+- **Live local Ollama SLM evaluation (`gemma4:e4b-it-qat`, writes per-ticket raw outputs to `tests/eval_predictions.jsonl`):**
+  ```bash
+  .venv/bin/python scripts/eval_classifier.py --live-ollama --model gemma4:e4b-it-qat --workers 2 --predictions-out tests/eval_predictions.jsonl --write-report CALIBRATION_REPORT.md
+  ```
+- **Offline deterministic guardrail & keyword reference check:**
   ```bash
   .venv/bin/python scripts/eval_classifier.py
-  ```
-- **Live local Ollama SLM evaluation (100 stratified tickets; see [`CALIBRATION_REPORT.md`](CALIBRATION_REPORT.md) — `100.0%` intent & routing accuracy, `0.0%` false silent-drop rate, `0.0395` SLM 10-bin ECE, `57.9` avg completion tokens/ticket on `gemma4:e4b-it-qat`):**
-  ```bash
-  .venv/bin/python scripts/eval_classifier.py --live-ollama --model gemma4:e4b-it-qat --write-report CALIBRATION_REPORT.md
   ```
 
 ### 4. Run Exception-Driven Frontier Debugger Gate

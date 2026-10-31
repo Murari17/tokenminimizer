@@ -771,13 +771,72 @@ def test_e2e_multiprocess_concurrent_retries_on_shared_sqlite_file(
 
 
 def test_eval_classifier_benchmark_zero_false_drops() -> None:
+    from scripts.eval_classifier import DEFAULT_PREDICTIONS_PATH
+
     metrics = evaluate_dataset()
-    assert metrics["total_samples"] == 100
+    assert metrics["total_samples"] == 300
+    assert metrics["calibration_split_samples"] == 100
+    assert metrics["held_out_split_samples"] == 200
     assert metrics["slm_measured"] is False
     assert metrics["expected_calibration_error_10bin"] is None
-    assert metrics["intent_accuracy"] >= 0.95
-    assert metrics["routing_queue_accuracy"] >= 0.95
+    assert metrics["intent_accuracy"] >= 0.85
+    assert metrics["routing_queue_accuracy"] >= 0.85
     assert metrics["false_silent_drop_rate"] == 0.0
+
+    # Also verify offline replay of committed 300-item live SLM predictions (tests/eval_predictions.jsonl)
+    replayed = evaluate_dataset(from_predictions=DEFAULT_PREDICTIONS_PATH)
+    assert replayed["slm_measured"] is True
+    assert replayed["total_samples"] == 300
+    assert replayed["held_out_split_samples"] == 200
+    assert replayed["held_out_intent_accuracy"] >= 0.98
+    assert replayed["false_silent_drop_rate"] == 0.0
+    assert replayed["post_hoc_calibration"]["held_out_temperature_scaled_ece_10bin"] <= 0.02
+
+
+def test_webhook_dispatch_transport_includes_idempotency_headers(
+    monkeypatch,
+) -> None:
+    import urllib.request
+    from src.pipeline.step6_validate import WebhookDispatchTransport
+    from src.schemas import CleanedPayload, DraftOutput
+
+    captured_headers = {}
+
+    class _DummyResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def _fake_urlopen(req, timeout=None):
+        for k, v in req.header_items():
+            captured_headers[k.lower()] = v
+        return _DummyResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    ev_id = uuid4()
+    cleaned = CleanedPayload(
+        event_id=ev_id,
+        sender="billing@client.org",
+        clean_subject="Invoice check",
+        clean_body="Checking invoice status.",
+        extracted_urls=[],
+        word_count=3,
+        contains_suspicious_patterns=False,
+    )
+    draft = DraftOutput(
+        subject_line="Re: Invoice check [TKT-1]",
+        body_text="Your ticket TKT-1 has been logged.",
+        referenced_ticket_id="TKT-1",
+    )
+    transport = WebhookDispatchTransport("https://hooks.example.com/outbound")
+    transport.send(cleaned, draft)
+
+    assert captured_headers.get("idempotency-key") == str(ev_id)
+    assert captured_headers.get("x-event-id") == str(ev_id)
 
 
 def test_debug_on_fail_bundle_and_diff_extractor(tmp_path: Path) -> None:

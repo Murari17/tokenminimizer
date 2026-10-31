@@ -26,9 +26,9 @@ class EngineConfig:
         default_factory=lambda: int(os.environ.get("TM_MAX_TIMESTAMP_SKEW_SECONDS", "300"))
     )
     max_future_skew_seconds: int = 60
-    # Default 180s lease (3x worst-case 4 * 15s = 60s SLM timeout budget across Steps 3 & 5)
+    # Default 240s lease (comfortable margin above worst-case 4 * 30s = 120s SLM timeout budget)
     pending_lease_seconds: float = field(
-        default_factory=lambda: float(os.environ.get("TM_PENDING_LEASE_SECONDS", "180.0"))
+        default_factory=lambda: float(os.environ.get("TM_PENDING_LEASE_SECONDS", "240.0"))
     )
     max_clean_body_chars: int = 2000
 
@@ -37,10 +37,10 @@ class EngineConfig:
         default_factory=lambda: os.environ.get("TM_OLLAMA_URL", "http://127.0.0.1:11434")
     )
     classify_model: str = field(
-        default_factory=lambda: os.environ.get("TM_CLASSIFY_MODEL", "qwen2.5:1.5b")
+        default_factory=lambda: os.environ.get("TM_CLASSIFY_MODEL", "gemma4:e4b-it-qat")
     )
     draft_model: str = field(
-        default_factory=lambda: os.environ.get("TM_DRAFT_MODEL", "llama3.2:3b")
+        default_factory=lambda: os.environ.get("TM_DRAFT_MODEL", "gemma4:e4b-it-qat")
     )
 
     # Hard token caps and deterministic generation parameters
@@ -48,7 +48,7 @@ class EngineConfig:
     draft_max_tokens: int = 200
     temperature: float = 0.0
     http_timeout_seconds: float = field(
-        default_factory=lambda: float(os.environ.get("TM_HTTP_TIMEOUT_SECONDS", "15.0"))
+        default_factory=lambda: float(os.environ.get("TM_HTTP_TIMEOUT_SECONDS", "30.0"))
     )
     max_retries: int = 1
 
