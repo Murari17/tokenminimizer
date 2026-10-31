@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 from src.config import ConfigurationError, DEFAULT_CONFIG
+from src.database import DuplicateEventError
 from src.schemas import RawTriggerPayload
 from src.security import compute_hmac_signature, verify_hmac_signature
 
@@ -17,7 +18,7 @@ class TriggerIngestionError(ValueError):
     """Raised when incoming trigger payload fails size, signature, replay, or schema checks."""
 
 
-class ReplayAttackError(TriggerIngestionError):
+class ReplayAttackError(TriggerIngestionError, DuplicateEventError):
     """Raised when a trigger payload is stale, future-skewed, or replays an existing event_id."""
 
 

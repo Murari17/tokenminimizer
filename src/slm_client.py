@@ -101,7 +101,7 @@ class LocalSLMClient:
             self._call_history.clear()
 
     @contextmanager
-    def track_Scope_tokens(self) -> Iterator[List[int]]:
+    def track_scope_tokens(self) -> Iterator[List[int]]:
         """Context-local token counter [prompt_tokens, eval_tokens] isolated per concurrent event."""
         bucket = [0, 0]
         token = _SCOPED_TOKEN_ACCUMULATOR.set(bucket)
@@ -109,6 +109,9 @@ class LocalSLMClient:
             yield bucket
         finally:
             _SCOPED_TOKEN_ACCUMULATOR.reset(token)
+
+    # Backwards-compatible alias
+    track_Scope_tokens = track_scope_tokens
 
     def _record_tokens(self, model: str, prompt_tokens: int, eval_tokens: int) -> None:
         with self._lock:
@@ -158,12 +161,7 @@ class LocalSLMClient:
         num_predict: int = 128,
         temperature: float = 0.0,
     ) -> T:
-        """Invoke the local SLM with JSON schema enforcement, hard token caps, and self-correcting retry.
-
-        When a retry is triggered by a JSON/schema validation error at `temperature=0.0`,
-        the validation error details are appended to the prompt so the retry is not an identical
-        deterministic call.
-        """
+        """Invoke the local SLM with JSON schema enforcement, hard token caps, and self-correcting retry."""
         json_schema = response_schema.model_json_schema()
         attempts = self.max_retries + 1
         last_error: Optional[Exception] = None

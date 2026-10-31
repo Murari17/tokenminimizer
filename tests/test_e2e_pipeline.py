@@ -1,22 +1,24 @@
-"""End-to-end 6-stage integration tests, replay protection, concurrency isolation,
-classifier evaluation benchmark, and exception-driven debugger gate verification.
+"""End-to-end 6-stage integration tests, concurrent duplicate-send prevention,
+concurrency token isolation, classifier evaluation benchmark, and debugger gate verification.
 """
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import List
 
 import pytest
 
 from scripts.debug_on_fail import build_debug_bundle, extract_failing_tests, extract_unified_diff
 from scripts.eval_classifier import evaluate_dataset
 from src.config import EngineConfig
-from src.database import Database
+from src.database import Database, DuplicateEventError
 from src.orchestrator import WorkflowOrchestrator
 from src.pipeline.step1_trigger import ReplayAttackError
 from src.pipeline.step6_validate import InMemoryOutboxTransport
-from src.schemas import DispatchStatus
+from src.schemas import DispatchReceipt, DispatchStatus
 from src.slm_client import LocalSLMClient
 from tests.conftest import MockOllamaController
 
@@ -109,13 +111,84 @@ def test_e2e_replay_protection_blocks_second_submission_with_zero_tokens(
     assert len(outbox.sent_messages) == 1
     assert slm_client.total_tokens_used == 160
 
-    # Replaying the exact same signed payload is rejected before any SLM call or second DB row!
     with pytest.raises(ReplayAttackError, match="Replay detected"):
         orchestrator.process_event(raw)
 
     assert memory_db.count_logs() == 1
     assert len(outbox.sent_messages) == 1
     assert slm_client.total_tokens_used == 160
+
+
+def test_e2e_same_signed_event_from_5_concurrent_threads_dispatches_only_once(
+    make_signed_trigger,
+    secret_key: str,
+    slm_client: LocalSLMClient,
+    mock_ollama: MockOllamaController,
+    memory_db: Database,
+) -> None:
+    """Regression test for TOCTOU race: 5 threads firing the exact same signed event at once
+    must produce 1 SENT receipt, 4 DuplicateEventError/ReplayAttackError, 1 DB row, and ONLY 1 sent message.
+    """
+    outbox = InMemoryOutboxTransport()
+    same_raw_event = make_signed_trigger(
+        sender="billing@client.org",
+        raw_subject="Concurrent webhook retry test",
+        raw_body="Please check invoice INV-555.",
+    )
+    # Queue only 1 classification + 1 draft response: if a second thread leaked through to SLM or send,
+    # MockOllamaController would fail or outbox would have >1 message.
+    mock_ollama.queue_ollama_json(
+        {
+            "intent": "BILLING",
+            "confidence": 0.94,
+            "detected_entities": ["INV-555"],
+            "requires_human_review": False,
+        },
+        prompt_eval_count=50,
+        eval_count=20,
+    )
+    mock_ollama.queue_ollama_json(
+        {
+            "subject_line": "Re: Concurrent webhook retry test [TKT-555]",
+            "body_text": "We have logged your inquiry for INV-555 under TKT-555.",
+            "referenced_ticket_id": "TKT-555",
+        },
+        prompt_eval_count=60,
+        eval_count=30,
+    )
+
+    orchestrator = WorkflowOrchestrator(
+        config=EngineConfig(webhook_secret=secret_key),
+        slm_client=slm_client,
+        db=memory_db,
+        transport=outbox,
+    )
+
+    barrier = threading.Barrier(5)
+    successes: List[DispatchReceipt] = []
+    duplicates: List[Exception] = []
+    lock = threading.Lock()
+
+    def _worker() -> None:
+        barrier.wait()
+        try:
+            r = orchestrator.process_event(same_raw_event)
+            with lock:
+                successes.append(r)
+        except DuplicateEventError as exc:
+            with lock:
+                duplicates.append(exc)
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [pool.submit(_worker) for _ in range(5)]
+        for f in futures:
+            f.result()
+
+    assert len(successes) == 1
+    assert successes[0].status == DispatchStatus.SENT
+    assert len(duplicates) == 4
+    assert len(outbox.sent_messages) == 1
+    assert memory_db.count_logs() == 1
 
 
 def test_e2e_critical_security_report_escalates_without_drafting(
@@ -321,6 +394,9 @@ def test_e2e_concurrent_events_maintain_thread_safe_sqlite_and_isolated_tokens(
 
 def test_eval_classifier_benchmark_zero_false_drops() -> None:
     metrics = evaluate_dataset()
+    assert metrics["total_samples"] == 30
+    assert metrics["slm_measured"] is False
+    assert metrics["expected_calibration_error_10bin"] is None
     assert metrics["intent_accuracy"] == 1.0
     assert metrics["routing_queue_accuracy"] == 1.0
     assert metrics["false_silent_drop_rate"] == 0.0
@@ -344,6 +420,8 @@ def test_debug_on_fail_bundle_and_diff_extractor(tmp_path: Path) -> None:
     content = written.read_text(encoding="utf-8")
     assert "test_step1_valid_hmac_signature_passes" in content
 
-    diff = extract_unified_diff("Here is the fix:\n```diff\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-x=1\n+x=2\n```")
+    diff = extract_unified_diff(
+        "Here is the fix:\n```diff\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-x=1\n+x=2\n```"
+    )
     assert diff is not None
     assert "--- a/src/a.py" in diff

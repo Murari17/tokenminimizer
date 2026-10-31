@@ -1,4 +1,6 @@
-"""Thread-safe parameterized SQLite persistence layer with replay protection (`UNIQUE event_id`)."""
+"""Thread-safe parameterized SQLite persistence layer with atomic reservation (`status='PENDING'`)
+and `UNIQUE(event_id)` replay/concurrency protection.
+"""
 
 from __future__ import annotations
 
@@ -18,11 +20,11 @@ from src.schemas import (
 
 
 class DuplicateEventError(ValueError):
-    """Raised when an event_id has already been processed (replay attack protection)."""
+    """Raised when an event_id has already been reserved or processed (replay/race protection)."""
 
 
 class Database:
-    """Thread-safe SQLite persistence layer enforcing parameterized queries and unique event_ids."""
+    """Thread-safe SQLite persistence layer enforcing parameterized queries and atomic reservations."""
 
     def __init__(self, db_path: str = ":memory:") -> None:
         self.db_path = db_path
@@ -56,7 +58,7 @@ class Database:
             self._conn.commit()
 
     def has_event_id(self, event_id: UUID | str) -> bool:
-        """Check whether `event_id` has already been recorded in `audit_logs`."""
+        """Check whether `event_id` has already been reserved or recorded in `audit_logs`."""
         with self._lock:
             cursor = self._conn.cursor()
             cursor.execute(
@@ -65,22 +67,19 @@ class Database:
             )
             return cursor.fetchone() is not None
 
-    def record_dispatch(
+    def reserve_event(
         self,
-        *,
-        data: CleanedPayload,
-        rules: RuleEvaluationResult,
-        status: DispatchStatus,
-        draft: Optional[DraftOutput],
-        escalate_to_human: bool,
-        tokens_used: int,
+        event_id: UUID | str,
+        sender: str,
+        clean_subject: str = "",
     ) -> int:
-        """Persist pipeline execution trace using parameterized SQL and enforce UNIQUE event_id."""
-        draft_serialized: Optional[str] = (
-            json.dumps(draft.model_dump(mode="json")) if draft is not None else None
-        )
-        created_at = datetime.now(timezone.utc).isoformat()
+        """Atomically insert a `PENDING` row for `event_id` before any SLM call or transport send.
 
+        Guarantees that under concurrent webhook retries, only a single thread can win the
+        reservation; all other concurrent threads immediately fail with `DuplicateEventError`
+        before dispatching duplicate messages.
+        """
+        created_at = datetime.now(timezone.utc).isoformat()
         with self._lock:
             cursor = self._conn.cursor()
             try:
@@ -98,33 +97,99 @@ class Database:
                         tokens_used,
                         draft_json,
                         created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, 'PENDING', 'LOW', 'pending', 0, 0, 0, NULL, ?)
                     """,
-                    (
-                        str(data.event_id),
-                        data.sender,
-                        data.clean_subject,
-                        status.value,
-                        rules.priority.value,
-                        rules.assigned_queue,
-                        int(rules.sla_hours),
-                        1 if escalate_to_human else 0,
-                        int(tokens_used),
-                        draft_serialized,
-                        created_at,
-                    ),
+                    (str(event_id), sender, clean_subject, created_at),
                 )
                 self._conn.commit()
             except sqlite3.IntegrityError as exc:
                 self._conn.rollback()
                 raise DuplicateEventError(
-                    f"Replay detected: event_id {data.event_id} has already been processed."
+                    f"Replay detected: event_id {event_id} is already reserved or processed."
                 ) from exc
 
             row_id = cursor.lastrowid
             if row_id is None:
-                raise RuntimeError("Failed to retrieve SQLite lastrowid after audit insert.")
+                raise RuntimeError("Failed to retrieve SQLite lastrowid after event reservation.")
             return int(row_id)
+
+    def finalize_dispatch(
+        self,
+        audit_log_id: int,
+        *,
+        data: CleanedPayload,
+        rules: RuleEvaluationResult,
+        status: DispatchStatus,
+        draft: Optional[DraftOutput],
+        escalate_to_human: bool,
+        tokens_used: int,
+    ) -> int:
+        """Update a previously reserved `PENDING` audit row to its terminal status after dispatch."""
+        draft_serialized: Optional[str] = (
+            json.dumps(draft.model_dump(mode="json")) if draft is not None else None
+        )
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute(
+                """
+                UPDATE audit_logs
+                SET sender = ?,
+                    clean_subject = ?,
+                    status = ?,
+                    priority = ?,
+                    assigned_queue = ?,
+                    sla_hours = ?,
+                    escalate_to_human = ?,
+                    tokens_used = ?,
+                    draft_json = ?
+                WHERE id = ?
+                """,
+                (
+                    data.sender,
+                    data.clean_subject,
+                    status.value,
+                    rules.priority.value,
+                    rules.assigned_queue,
+                    int(rules.sla_hours),
+                    1 if escalate_to_human else 0,
+                    int(tokens_used),
+                    draft_serialized,
+                    int(audit_log_id),
+                ),
+            )
+            self._conn.commit()
+            return int(audit_log_id)
+
+    def record_dispatch(
+        self,
+        *,
+        data: CleanedPayload,
+        rules: RuleEvaluationResult,
+        status: DispatchStatus,
+        draft: Optional[DraftOutput],
+        escalate_to_human: bool,
+        tokens_used: int,
+        reserved_log_id: Optional[int] = None,
+    ) -> int:
+        """Reserve (if not already reserved) and finalize the pipeline execution trace."""
+        log_id = (
+            reserved_log_id
+            if reserved_log_id is not None
+            else self.reserve_event(
+                event_id=data.event_id,
+                sender=data.sender,
+                clean_subject=data.clean_subject,
+            )
+        )
+        return self.finalize_dispatch(
+            log_id,
+            data=data,
+            rules=rules,
+            status=status,
+            draft=draft,
+            escalate_to_human=escalate_to_human,
+            tokens_used=tokens_used,
+        )
 
     def get_audit_log(self, audit_log_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve a single audit log record by primary key."""

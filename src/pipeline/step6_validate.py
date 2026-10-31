@@ -1,5 +1,5 @@
-"""Stage 6 [CODE — 0 Tokens]: Output guardrails, PII leak check, SQLite audit save,
-and real outbound dispatch transport.
+"""Stage 6 [CODE — 0 Tokens]: Output guardrails, PII leak check, atomic SQLite reservation
+before dispatch (preventing concurrent duplicate sends), and outbound delivery transport.
 """
 
 from __future__ import annotations
@@ -7,9 +7,10 @@ from __future__ import annotations
 import json
 import threading
 import urllib.request
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable, List, Optional, Protocol
+from typing import Deque, Iterable, Optional, Protocol
 from uuid import UUID
 
 from src.config import DEFAULT_CONFIG
@@ -49,11 +50,11 @@ class DispatchTransport(Protocol):
 
 
 class InMemoryOutboxTransport:
-    """Thread-safe deterministic outbox transport that records dispatched replies."""
+    """Thread-safe, memory-bounded outbox transport that records dispatched replies."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_items: int = 1000) -> None:
         self._lock = threading.Lock()
-        self._outbox: List[DispatchedMessage] = []
+        self._outbox: Deque[DispatchedMessage] = deque(maxlen=max_items)
 
     def send(self, data: CleanedPayload, draft: DraftOutput) -> DispatchedMessage:
         msg = DispatchedMessage(
@@ -117,7 +118,7 @@ class WebhookDispatchTransport:
         return msg
 
 
-DEFAULT_OUTBOX_TRANSPORT = InMemoryOutboxTransport()
+DEFAULT_OUTBOX_TRANSPORT = InMemoryOutboxTransport(max_items=1000)
 
 
 def is_draft_safe(
@@ -127,9 +128,9 @@ def is_draft_safe(
     """Run deterministic security and policy guardrails on an outbound draft.
 
     Rejects if `subject_line` or `body_text` contains:
-    - Leaked PII/secrets (Luhn-valid credit card numbers, SSNs, API keys, private IPs)
-    - Forbidden commitment phrases ("we guarantee you a full refund", "accept liability", etc.)
-    - URLs (including uppercase HTTP://, protocol-relative //, www., or bare domains) not on allowlist
+    - Leaked PII/secrets (Luhn-valid credit card numbers, SSNs with/without dashes, API keys, private IPs)
+    - Forbidden commitment phrases ("100% money-back guarantee", "we will sue", "accept liability", etc.)
+    - URLs (including uppercase HTTP://, hxxps://, protocol-relative //, www., or bare domains) not on allowlist
     - Unescaped HTML / script tags
     """
     combined = f"{draft.subject_line}\n{draft.body_text}"
@@ -152,15 +153,30 @@ def validate_save_send(
     tokens_used: int = 0,
     allowed_domains: Iterable[str] = DEFAULT_CONFIG.allowed_domains,
     transport: Optional[DispatchTransport] = None,
+    reserved_log_id: Optional[int] = None,
 ) -> DispatchReceipt:
-    """Validate outbound draft, dispatch via `DispatchTransport`, and persist audit trace to SQLite.
+    """Atomically reserve `event_id` (`status='PENDING'`), validate and send draft, then finalize to `SENT`.
 
-    Tokens consumed: 0.
+    Reserving the row in SQLite *before* calling `active_transport.send()` eliminates the
+    check-then-act race condition under concurrent webhook retries: only the single thread
+    that wins the `INSERT ... status='PENDING'` reservation ever calls `transport.send()`.
     """
-    active_transport = transport if transport is not None else DEFAULT_OUTBOX_TRANSPORT
+    # 1. Atomically reserve the event_id in SQLite BEFORE any transport dispatch
+    audit_log_id = (
+        reserved_log_id
+        if reserved_log_id is not None
+        else db.reserve_event(
+            event_id=data.event_id,
+            sender=data.sender,
+            clean_subject=data.clean_subject,
+        )
+    )
+
+    active_transport = transport if transport is not None else InMemoryOutboxTransport(max_items=100)
     escalate_to_human = rules.escalate_to_human
     final_payload: Optional[DraftOutput] = None
 
+    # 2. Validate guardrails and dispatch ONLY after reservation succeeded
     if draft is None:
         if rules.assigned_queue == "trash" and not rules.escalate_to_human:
             status = DispatchStatus.DROPPED_SPAM
@@ -174,7 +190,6 @@ def validate_save_send(
                 status = DispatchStatus.SENT
                 final_payload = draft
             except Exception:
-                # If outbound delivery transport fails, never claim SENT; escalate to human
                 status = DispatchStatus.ESCALATED
                 escalate_to_human = True
                 final_payload = None
@@ -183,7 +198,9 @@ def validate_save_send(
             escalate_to_human = True
             final_payload = None
 
-    audit_log_id = db.record_dispatch(
+    # 3. Update the reserved `PENDING` row to its terminal status
+    db.finalize_dispatch(
+        audit_log_id,
         data=data,
         rules=rules,
         status=status,
