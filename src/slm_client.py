@@ -1,12 +1,17 @@
-"""Zero-dependency HTTP client for local SLMs (Ollama/vLLM) with strict JSON schema enforcement."""
+"""Zero-dependency HTTP client for local SLMs (Ollama/vLLM) with strict JSON schema enforcement,
+thread-safe token accounting, and self-correcting schema retries.
+"""
 
 from __future__ import annotations
 
+import contextvars
 import json
+import threading
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Optional, Type, TypeVar
+from typing import Iterator, List, Optional, Type, TypeVar
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ValidationError
@@ -15,9 +20,17 @@ from src.config import DEFAULT_CONFIG, EngineConfig
 
 T = TypeVar("T", bound=BaseModel)
 
+_SCOPED_TOKEN_ACCUMULATOR: contextvars.ContextVar[Optional[List[int]]] = contextvars.ContextVar(
+    "_SCOPED_TOKEN_ACCUMULATOR", default=None
+)
+
 
 class SLMClientError(RuntimeError):
     """Raised when the local SLM fails to respond or violates the schema contract."""
+
+
+class SLMTransportError(SLMClientError):
+    """Raised when the local SLM HTTP transport times out or is unreachable."""
 
 
 @dataclass(frozen=True)
@@ -34,7 +47,7 @@ class SLMCallMetrics:
 
 
 class LocalSLMClient:
-    """Zero-dependency HTTP client for local small language models via Ollama `/api/generate`."""
+    """Thread-safe zero-dependency HTTP client for local SLMs via Ollama `/api/generate`."""
 
     def __init__(
         self,
@@ -49,6 +62,7 @@ class LocalSLMClient:
             timeout_seconds if timeout_seconds is not None else config.http_timeout_seconds
         )
         self.max_retries = max_retries if max_retries is not None else config.max_retries
+        self._lock = threading.Lock()
         self._total_prompt_tokens: int = 0
         self._total_completion_tokens: int = 0
         self._call_history: list[SLMCallMetrics] = []
@@ -61,25 +75,56 @@ class LocalSLMClient:
 
     @property
     def total_prompt_tokens(self) -> int:
-        return self._total_prompt_tokens
+        with self._lock:
+            return self._total_prompt_tokens
 
     @property
     def total_completion_tokens(self) -> int:
-        return self._total_completion_tokens
+        with self._lock:
+            return self._total_completion_tokens
 
     @property
     def total_tokens_used(self) -> int:
-        return self._total_prompt_tokens + self._total_completion_tokens
+        with self._lock:
+            return self._total_prompt_tokens + self._total_completion_tokens
 
     @property
     def call_history(self) -> tuple[SLMCallMetrics, ...]:
-        return tuple(self._call_history)
+        with self._lock:
+            return tuple(self._call_history)
 
     def reset_token_counters(self) -> None:
-        """Reset accumulated token counters between independent runs if desired."""
-        self._total_prompt_tokens = 0
-        self._total_completion_tokens = 0
-        self._call_history.clear()
+        """Reset accumulated token counters cleanly."""
+        with self._lock:
+            self._total_prompt_tokens = 0
+            self._total_completion_tokens = 0
+            self._call_history.clear()
+
+    @contextmanager
+    def track_Scope_tokens(self) -> Iterator[List[int]]:
+        """Context-local token counter [prompt_tokens, eval_tokens] isolated per concurrent event."""
+        bucket = [0, 0]
+        token = _SCOPED_TOKEN_ACCUMULATOR.set(bucket)
+        try:
+            yield bucket
+        finally:
+            _SCOPED_TOKEN_ACCUMULATOR.reset(token)
+
+    def _record_tokens(self, model: str, prompt_tokens: int, eval_tokens: int) -> None:
+        with self._lock:
+            self._total_prompt_tokens += prompt_tokens
+            self._total_completion_tokens += eval_tokens
+            self._call_history.append(
+                SLMCallMetrics(
+                    model=model,
+                    prompt_eval_count=prompt_tokens,
+                    eval_count=eval_tokens,
+                )
+            )
+        scoped_bucket = _SCOPED_TOKEN_ACCUMULATOR.get()
+        if scoped_bucket is not None:
+            scoped_bucket[0] += prompt_tokens
+            scoped_bucket[1] += eval_tokens
 
     def _post_json(self, endpoint: str, payload: dict) -> dict:
         """Perform a zero-dependency HTTP POST request with strict timeout."""
@@ -99,7 +144,7 @@ class LocalSLMClient:
                 raw_response = response.read().decode("utf-8")
                 return json.loads(raw_response)
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
-            raise SLMClientError(f"Local SLM HTTP transport failure: {exc}") from exc
+            raise SLMTransportError(f"Local SLM HTTP transport failure: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise SLMClientError(f"Local SLM returned non-JSON HTTP envelope: {exc}") from exc
 
@@ -113,38 +158,34 @@ class LocalSLMClient:
         num_predict: int = 128,
         temperature: float = 0.0,
     ) -> T:
-        """Invoke the local SLM with JSON schema enforcement, hard token caps, and retry handling."""
-        json_schema = response_schema.model_json_schema()
-        payload = {
-            "model": model,
-            "system": system_prompt,
-            "prompt": user_prompt,
-            "stream": False,
-            "format": json_schema,
-            "options": {
-                "temperature": float(temperature),
-                "num_predict": int(num_predict),
-            },
-        }
+        """Invoke the local SLM with JSON schema enforcement, hard token caps, and self-correcting retry.
 
+        When a retry is triggered by a JSON/schema validation error at `temperature=0.0`,
+        the validation error details are appended to the prompt so the retry is not an identical
+        deterministic call.
+        """
+        json_schema = response_schema.model_json_schema()
         attempts = self.max_retries + 1
         last_error: Optional[Exception] = None
+        active_prompt = user_prompt
 
-        for _ in range(attempts):
+        for attempt_idx in range(attempts):
+            payload = {
+                "model": model,
+                "system": system_prompt,
+                "prompt": active_prompt,
+                "stream": False,
+                "format": json_schema,
+                "options": {
+                    "temperature": float(temperature),
+                    "num_predict": int(num_predict),
+                },
+            }
             try:
                 envelope = self._post_json("/api/generate", payload)
                 prompt_tokens = max(0, int(envelope.get("prompt_eval_count", 0) or 0))
                 eval_tokens = max(0, int(envelope.get("eval_count", 0) or 0))
-
-                self._total_prompt_tokens += prompt_tokens
-                self._total_completion_tokens += eval_tokens
-                self._call_history.append(
-                    SLMCallMetrics(
-                        model=model,
-                        prompt_eval_count=prompt_tokens,
-                        eval_count=eval_tokens,
-                    )
-                )
+                self._record_tokens(model, prompt_tokens, eval_tokens)
 
                 raw_content = envelope.get("response", "")
                 if isinstance(raw_content, dict):
@@ -154,10 +195,22 @@ class LocalSLMClient:
 
                 parsed_json = json.loads(raw_content)
                 return response_schema.model_validate(parsed_json)
+            except SLMTransportError as exc:
+                last_error = exc
             except (SLMClientError, json.JSONDecodeError, ValidationError, TypeError, ValueError) as exc:
                 last_error = exc
+                if attempt_idx + 1 < attempts:
+                    err_summary = str(exc).splitlines()[0][:240]
+                    active_prompt = (
+                        f"{user_prompt}\n\n"
+                        f"[SCHEMA VALIDATION CORRECTION: Your previous output was invalid "
+                        f"({err_summary}). Output ONLY valid JSON matching {response_schema.__name__}.]"
+                    )
 
+        if isinstance(last_error, SLMTransportError):
+            raise SLMTransportError(
+                f"SLM transport failed after {attempts} attempt(s) for {response_schema.__name__}: {last_error}"
+            ) from last_error
         raise SLMClientError(
             f"SLM generation failed after {attempts} attempt(s) for {response_schema.__name__}: {last_error}"
         ) from last_error
-

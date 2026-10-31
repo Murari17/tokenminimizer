@@ -4,7 +4,8 @@
 Runs `pytest --tb=short -q` deterministically (0 tokens).
 - If exit code == 0: prints confirmation and exits cleanly with 0 frontier tokens spent.
 - If exit code != 0: packages failing test names, tracebacks, and relevant source files
-  into `.debug_bundle.md` and optionally invokes a frontier CLI (`claude -p` or `openai`).
+  into `.debug_bundle.md`, pipes the bundle over `stdin` (avoiding OS `ARG_MAX` limits)
+  to a frontier CLI when requested, and can optionally validate & apply unified diff patches.
 """
 
 from __future__ import annotations
@@ -16,13 +17,14 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Set
+from typing import Iterable, List, Optional, Set
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BUNDLE_PATH = PROJECT_ROOT / ".debug_bundle.md"
 
 _FAILED_TEST_RE = re.compile(r"^FAILED\s+([^\s]+)", re.MULTILINE)
 _FILE_REF_RE = re.compile(r"((?:src|tests)/[a-zA-Z0-9_./\-]+\.py)")
+_DIFF_BLOCK_RE = re.compile(r"```(?:diff|patch)\n(.*?)```", re.DOTALL)
 
 
 def extract_failing_tests(pytest_output: str) -> List[str]:
@@ -42,6 +44,61 @@ def extract_referenced_files(pytest_output: str, root: Path = PROJECT_ROOT) -> L
             seen.add(candidate)
             resolved.append(candidate)
     return resolved
+
+
+def extract_unified_diff(frontier_output: str) -> Optional[str]:
+    """Extract a unified diff fenced block (` ```diff ... ``` `) from frontier model output."""
+    match = _DIFF_BLOCK_RE.search(frontier_output)
+    if match:
+        return match.group(1).strip() + "\n"
+    if "--- a/" in frontier_output and "+++ b/" in frontier_output:
+        lines = []
+        capture = False
+        for line in frontier_output.splitlines():
+            if line.startswith(("diff --git ", "--- a/")):
+                capture = True
+            if capture:
+                lines.append(line)
+        if lines:
+            return "\n".join(lines) + "\n"
+    return None
+
+
+def apply_and_verify_patch(diff_text: str, root: Path = PROJECT_ROOT) -> bool:
+    """Validate unified diff via `git apply --check`, apply it, and re-run pytest."""
+    git_bin = shutil.which("git")
+    if not git_bin:
+        return False
+    check_proc = subprocess.run(
+        [git_bin, "apply", "--check", "-"],
+        input=diff_text,
+        text=True,
+        cwd=str(root),
+        capture_output=True,
+        check=False,
+    )
+    if check_proc.returncode != 0:
+        return False
+
+    apply_proc = subprocess.run(
+        [git_bin, "apply", "-"],
+        input=diff_text,
+        text=True,
+        cwd=str(root),
+        capture_output=True,
+        check=False,
+    )
+    if apply_proc.returncode != 0:
+        return False
+
+    verify_proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "--tb=short", "-q"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return verify_proc.returncode == 0
 
 
 def build_debug_bundle(
@@ -94,8 +151,9 @@ def build_debug_bundle(
     sections.extend(
         [
             "## 3. Repair Instructions for Frontier Debugger",
-            "Identify the root cause of the failing deterministic/contract test(s) above and provide "
-            "a minimal, surgical fix that preserves all Pydantic V2 contracts and security invariants.",
+            "Identify the root cause of the failing deterministic/contract test(s) above and output "
+            "a minimal unified diff inside a ```diff fenced code block that resolves the failure "
+            "while preserving all Pydantic V2 contracts and security invariants.",
             "",
         ]
     )
@@ -104,33 +162,50 @@ def build_debug_bundle(
     return bundle_path
 
 
-def invoke_frontier_cli(bundle_path: Path, cli_provider: str) -> int:
-    """Optionally invoke `claude -p` or `openai` CLI with the diagnostic bundle."""
+def invoke_frontier_cli(
+    bundle_path: Path,
+    cli_provider: str,
+    auto_apply: bool = False,
+) -> int:
+    """Invoke `claude` or `openai` CLI piping the bundle over `stdin` to avoid OS `ARG_MAX` limits."""
     prompt_text = bundle_path.read_text(encoding="utf-8")
     if cli_provider == "claude":
         binary = shutil.which("claude")
         if not binary:
             print("Frontier CLI 'claude' not found in PATH; skipping remote call.", file=sys.stderr)
             return 1
-        proc = subprocess.run([binary, "-p", prompt_text], check=False)
-        return proc.returncode
-    if cli_provider == "openai":
+        cmd = [binary, "-p", "Read the diagnostic bundle from stdin and output a unified diff fix."]
+    elif cli_provider == "openai":
         binary = shutil.which("openai")
         if not binary:
             print("Frontier CLI 'openai' not found in PATH; skipping remote call.", file=sys.stderr)
             return 1
-        proc = subprocess.run(
-            [binary, "api", "chat.completions.create", "-m", "gpt-4o", "-g", "user", prompt_text],
-            check=False,
-        )
-        return proc.returncode
-    return 1
+        cmd = [binary, "api", "chat.completions.create", "-m", "gpt-4o"]
+    else:
+        return 1
+
+    proc = subprocess.run(
+        cmd,
+        input=prompt_text,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if proc.stdout:
+        print(proc.stdout)
+        if auto_apply:
+            diff_text = extract_unified_diff(proc.stdout)
+            if diff_text and apply_and_verify_patch(diff_text):
+                print("Applied frontier patch and verified all pytest checks now pass.")
+                return 0
+    return proc.returncode
 
 
 def run_test_gate(
     pytest_args: Iterable[str] | None = None,
     bundle_path: Path = DEFAULT_BUNDLE_PATH,
     frontier_cli: str | None = None,
+    auto_apply: bool = False,
 ) -> int:
     """Execute pytest and only build/invoke frontier diagnostics if exit code != 0."""
     cmd = [sys.executable, "-m", "pytest", "--tb=short", "-q"]
@@ -163,7 +238,7 @@ def run_test_gate(
     )
 
     if frontier_cli in ("claude", "openai"):
-        invoke_frontier_cli(written_path, frontier_cli)
+        return invoke_frontier_cli(written_path, frontier_cli, auto_apply=auto_apply)
 
     return completed.returncode
 
@@ -176,7 +251,12 @@ def main() -> int:
         "--frontier-cli",
         choices=["claude", "openai"],
         default=None,
-        help="Optionally invoke a frontier CLI with .debug_bundle.md when pytest fails.",
+        help="Optionally invoke a frontier CLI (via stdin) with .debug_bundle.md when pytest fails.",
+    )
+    parser.add_argument(
+        "--apply-patch",
+        action="store_true",
+        help="Automatically validate and apply a unified diff returned by the frontier CLI.",
     )
     parser.add_argument(
         "--bundle-path",
@@ -189,9 +269,9 @@ def main() -> int:
         pytest_args=extra_pytest_args,
         bundle_path=args.bundle_path,
         frontier_cli=args.frontier_cli,
+        auto_apply=args.apply_patch,
     )
 
 
 if __name__ == "__main__":
     sys.exit(main())
-

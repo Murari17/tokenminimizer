@@ -91,23 +91,28 @@ def test_step3_short_circuits_with_zero_tokens_on_empty_body(
     assert len(mock_ollama.requests) == 0
 
 
-def test_step3_malformed_json_retries_once_then_triggers_fallback(
+def test_step3_malformed_json_appends_error_feedback_on_retry_then_falls_back(
     sample_cleaned_payload: CleanedPayload,
     slm_client: LocalSLMClient,
     mock_ollama: MockOllamaController,
 ) -> None:
-    # Initial attempt + 1 retry both return broken JSON
+    # Initial attempt + 1 self-correcting retry both return broken JSON
     mock_ollama.queue_ollama_json("{not_valid_json", prompt_eval_count=30, eval_count=10)
-    mock_ollama.queue_ollama_json("{\"intent\": \"INVALID_ENUM\"}", prompt_eval_count=30, eval_count=10)
+    mock_ollama.queue_ollama_json("{\"intent\": \"INVALID_ENUM\"}", prompt_eval_count=35, eval_count=10)
 
     result = read_and_classify(sample_cleaned_payload, slm_client)
     assert result.requires_human_review is True
     assert result.confidence == 0.0
     assert len(mock_ollama.requests) == 2
-    assert slm_client.total_tokens_used == 80
+    # Verify the second request prompt contains the schema correction feedback (not an identical prompt)
+    first_prompt = mock_ollama.requests[0]["payload"]["prompt"]
+    second_prompt = mock_ollama.requests[1]["payload"]["prompt"]
+    assert first_prompt != second_prompt
+    assert "SCHEMA VALIDATION CORRECTION" in second_prompt
+    assert slm_client.total_tokens_used == 85
 
 
-def test_step3_timeout_recovery_triggers_deterministic_fallback(
+def test_step3_timeout_recovery_triggers_slm_unavailable_fallback(
     sample_cleaned_payload: CleanedPayload,
     slm_client: LocalSLMClient,
     mock_ollama: MockOllamaController,
@@ -118,6 +123,7 @@ def test_step3_timeout_recovery_triggers_deterministic_fallback(
     result = read_and_classify(sample_cleaned_payload, slm_client)
     assert result.requires_human_review is True
     assert result.confidence == 0.0
+    assert "SLM_UNAVAILABLE" in result.detected_entities
     assert len(mock_ollama.requests) == 2
     assert slm_client.total_tokens_used == 0
 
@@ -143,7 +149,7 @@ def test_step5_skips_slm_with_zero_tokens_when_should_draft_is_false(
     assert len(mock_ollama.requests) == 0
 
 
-def test_step5_valid_slm_draft_enforces_200_token_cap_and_zero_temp(
+def test_step5_valid_slm_draft_includes_xml_boundary_and_body_context(
     sample_cleaned_payload: CleanedPayload,
     slm_client: LocalSLMClient,
     mock_ollama: MockOllamaController,
@@ -177,6 +183,9 @@ def test_step5_valid_slm_draft_enforces_200_token_cap_and_zero_temp(
     sent_req = mock_ollama.requests[0]["payload"]
     assert sent_req["options"]["num_predict"] == 200
     assert sent_req["options"]["temperature"] == 0.0
+    assert "<untrusted_context_" in sent_req["prompt"]
+    assert "</untrusted_context_" in sent_req["prompt"]
+    assert sample_cleaned_payload.clean_body in sent_req["prompt"]
 
 
 def test_step5_schema_failure_falls_back_to_static_format_template(
@@ -202,4 +211,3 @@ def test_step5_schema_failure_falls_back_to_static_format_template(
     assert draft.referenced_ticket_id == f"TKT-{expected_prefix}"
     assert "4-hour SLA" in draft.body_text
     assert "https://billing.example.com/help" in draft.body_text
-

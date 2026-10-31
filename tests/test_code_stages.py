@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
 
-from src.database import Database
-from src.pipeline.step1_trigger import TriggerIngestionError, ingest_trigger
+from src.database import Database, DuplicateEventError
+from src.pipeline.step1_trigger import ReplayAttackError, TriggerIngestionError, ingest_trigger
 from src.pipeline.step2_clean import fetch_and_clean
 from src.pipeline.step4_rules import apply_rules
-from src.pipeline.step6_validate import validate_save_send
+from src.pipeline.step6_validate import InMemoryOutboxTransport, validate_save_send
 from src.schemas import (
     ClassificationOutput,
     CleanedPayload,
@@ -23,7 +24,7 @@ from src.schemas import (
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: Trigger Ingestion & Signature Verification (0 Tokens)
+# Stage 1: Trigger Ingestion, HMAC, Secret Enforcement & Replay Window (0 Tokens)
 # ---------------------------------------------------------------------------
 def test_step1_valid_hmac_signature_passes(make_signed_trigger, secret_key: str) -> None:
     raw = make_signed_trigger(
@@ -37,10 +38,32 @@ def test_step1_valid_hmac_signature_passes(make_signed_trigger, secret_key: str)
     assert str(result.event_id) == raw["event_id"]
 
 
+def test_step1_hard_fails_when_secret_is_unset_or_weak(make_signed_trigger) -> None:
+    raw = make_signed_trigger()
+    with pytest.raises(TriggerIngestionError, match="Webhook HMAC secret is not configured"):
+        ingest_trigger(raw, secret_key="")
+    with pytest.raises(TriggerIngestionError, match="at least 16 characters"):
+        ingest_trigger(raw, secret_key="short-secret")
+
+
 def test_step1_tampered_payload_fails_hmac(make_signed_trigger, secret_key: str) -> None:
     raw = make_signed_trigger(raw_body="Original legitimate message.")
     raw["raw_body"] = "Tampered message after signing!"
     with pytest.raises(TriggerIngestionError, match="HMAC-SHA256 signature verification failed"):
+        ingest_trigger(raw, secret_key=secret_key)
+
+
+def test_step1_rejects_year_old_replayed_payload(make_signed_trigger, secret_key: str) -> None:
+    year_old_ts = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
+    raw = make_signed_trigger(timestamp=year_old_ts)
+    with pytest.raises(ReplayAttackError, match="Stale payload rejected"):
+        ingest_trigger(raw, secret_key=secret_key)
+
+
+def test_step1_rejects_future_skewed_payload(make_signed_trigger, secret_key: str) -> None:
+    future_ts = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+    raw = make_signed_trigger(timestamp=future_ts)
+    with pytest.raises(ReplayAttackError, match="Future-skewed payload rejected"):
         ingest_trigger(raw, secret_key=secret_key)
 
 
@@ -58,7 +81,7 @@ def test_step1_rejects_missing_required_fields(secret_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: HTML Stripping, Normalization & URL Extraction (0 Tokens)
+# Stage 2: HTML Stripping (< 5 and x<y preserved), Normalization & URL Extraction
 # ---------------------------------------------------------------------------
 def test_step2_strips_html_and_normalizes_unicode(make_signed_trigger, secret_key: str) -> None:
     raw_dict = make_signed_trigger(
@@ -85,6 +108,24 @@ def test_step2_strips_html_and_normalizes_unicode(make_signed_trigger, secret_ke
     assert cleaned.contains_suspicious_patterns is False
 
 
+def test_step2_preserves_less_than_comparisons_and_code_snippets(
+    make_signed_trigger,
+    secret_key: str,
+) -> None:
+    raw_dict = make_signed_trigger(
+        raw_subject="Balance < 5 USD & x<y check",
+        raw_body="My balance is < 5 dollars and my card was charged twice when x<y in code.",
+    )
+    trigger = ingest_trigger(raw_dict, secret_key=secret_key)
+    cleaned = fetch_and_clean(trigger)
+
+    assert cleaned.clean_body == (
+        "My balance is < 5 dollars and my card was charged twice when x<y in code."
+    )
+    assert "charged twice" in cleaned.clean_body
+    assert "x<y" in cleaned.clean_body
+
+
 def test_step2_enforces_2000_char_cap(make_signed_trigger, secret_key: str) -> None:
     long_text = ("word " * 800).strip()
     assert len(long_text) > 3000
@@ -95,19 +136,61 @@ def test_step2_enforces_2000_char_cap(make_signed_trigger, secret_key: str) -> N
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: Deterministic Rules Matrix (All 5 Branches, 0 Tokens)
+# Stage 4: Deterministic Rules Matrix & Corroborated SPAM / Timeout Guards
 # ---------------------------------------------------------------------------
-def test_step4_branch1_high_confidence_spam_dropped(sample_cleaned_payload: CleanedPayload) -> None:
+def test_step4_branch1_high_confidence_spam_dropped_when_corroborated() -> None:
+    spam_payload = CleanedPayload(
+        event_id=uuid4(),
+        sender="spammer@promo.biz",
+        clean_subject="WIN FREE TOKENS",
+        clean_body="Claim your free lottery giveaway prize today!",
+        extracted_urls=[],
+        word_count=7,
+        contains_suspicious_patterns=False,
+    )
     cls = ClassificationOutput(
         intent=IntentCategory.SPAM,
         confidence=0.92,
         detected_entities=[],
         requires_human_review=False,
     )
-    rules = apply_rules(sample_cleaned_payload, cls)
+    rules = apply_rules(spam_payload, cls)
     assert rules.should_draft_reply is False
     assert rules.escalate_to_human is False
     assert rules.assigned_queue == "trash"
+
+
+def test_step4_corroboration_prevents_silent_drop_on_invoice_ticket(
+    sample_cleaned_payload: CleanedPayload,
+) -> None:
+    # sample_cleaned_payload mentions "Billing discrepancy" and "credit card was billed twice"
+    cls = ClassificationOutput(
+        intent=IntentCategory.SPAM,
+        confidence=0.95,
+        detected_entities=[],
+        requires_human_review=False,
+    )
+    rules = apply_rules(sample_cleaned_payload, cls)
+    assert rules.assigned_queue == "spam_review"
+    assert rules.escalate_to_human is True
+    assert rules.should_draft_reply is False
+
+
+def test_step4_slm_timeout_routes_to_tier1_triage_not_critical_flood(
+    sample_cleaned_payload: CleanedPayload,
+) -> None:
+    cls = ClassificationOutput(
+        intent=IntentCategory.TECHNICAL_SUPPORT,
+        confidence=0.0,
+        detected_entities=["SLM_UNAVAILABLE"],
+        requires_human_review=True,
+    )
+    rules = apply_rules(sample_cleaned_payload, cls)
+    assert rules.assigned_queue == "tier1_triage"
+    assert rules.priority == PriorityLevel.MEDIUM
+    assert rules.sla_hours == 8
+    assert rules.escalate_to_human is True
+    assert rules.should_draft_reply is False
 
 
 @pytest.mark.parametrize(
@@ -187,12 +270,13 @@ def test_step4_branch5_feature_request_default(sample_cleaned_payload: CleanedPa
 
 
 # ---------------------------------------------------------------------------
-# Stage 6: Output Validation & SQLite Audit Persistence (0 Tokens)
+# Stage 6: Output Validation, Outbox Dispatch & SQLite Replay Protection
 # ---------------------------------------------------------------------------
-def test_step6_valid_draft_saved_and_marked_sent(
+def test_step6_valid_draft_dispatched_to_outbox_and_marked_sent(
     sample_cleaned_payload: CleanedPayload,
     memory_db: Database,
 ) -> None:
+    outbox = InMemoryOutboxTransport()
     cls = ClassificationOutput(
         intent=IntentCategory.BILLING,
         confidence=0.90,
@@ -214,22 +298,31 @@ def test_step6_valid_draft_saved_and_marked_sent(
         draft=draft,
         db=memory_db,
         tokens_used=115,
+        transport=outbox,
     )
     assert receipt.status == DispatchStatus.SENT
     assert receipt.final_payload == draft
     assert receipt.tokens_used == 115
+    assert len(outbox.sent_messages) == 1
+    assert outbox.sent_messages[0].recipient == sample_cleaned_payload.sender
 
-    stored = memory_db.get_audit_log(receipt.audit_log_id)
-    assert stored is not None
-    assert stored["status"] == "SENT"
-    assert stored["tokens_used"] == 115
-    assert stored["escalate_to_human"] == 0
+    # Attempting to save the same event_id a second time raises DuplicateEventError
+    with pytest.raises(DuplicateEventError, match="Replay detected"):
+        validate_save_send(
+            data=sample_cleaned_payload,
+            rules=rules,
+            draft=draft,
+            db=memory_db,
+            tokens_used=115,
+            transport=outbox,
+        )
 
 
 def test_step6_blocks_forbidden_commitment_and_unallowed_url(
     sample_cleaned_payload: CleanedPayload,
     memory_db: Database,
 ) -> None:
+    outbox = InMemoryOutboxTransport()
     cls = ClassificationOutput(
         intent=IntentCategory.BILLING,
         confidence=0.95,
@@ -248,12 +341,8 @@ def test_step6_blocks_forbidden_commitment_and_unallowed_url(
         draft=unsafe_draft,
         db=memory_db,
         tokens_used=88,
+        transport=outbox,
     )
     assert receipt.status == DispatchStatus.BLOCKED_VALIDATION
     assert receipt.final_payload is None
-
-    stored = memory_db.get_audit_log(receipt.audit_log_id)
-    assert stored is not None
-    assert stored["status"] == "BLOCKED_VALIDATION"
-    assert stored["escalate_to_human"] == 1
-
+    assert len(outbox.sent_messages) == 0

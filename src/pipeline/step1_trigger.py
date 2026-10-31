@@ -1,18 +1,24 @@
-"""Stage 1 [CODE — 0 Tokens]: Webhook/email/form/file ingestion & HMAC signature verification."""
+"""Stage 1 [CODE — 0 Tokens]: Webhook/email/form/file ingestion, HMAC signature verification,
+and timestamp replay window enforcement.
+"""
 
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict
 
-from src.config import DEFAULT_CONFIG
+from src.config import ConfigurationError, DEFAULT_CONFIG
 from src.schemas import RawTriggerPayload
 from src.security import compute_hmac_signature, verify_hmac_signature
 
 
 class TriggerIngestionError(ValueError):
-    """Raised when incoming trigger payload fails size, signature, or schema checks."""
+    """Raised when incoming trigger payload fails size, signature, replay, or schema checks."""
+
+
+class ReplayAttackError(TriggerIngestionError):
+    """Raised when a trigger payload is stale, future-skewed, or replays an existing event_id."""
 
 
 def _canonicalize_for_signing(raw_dict: Dict[str, Any]) -> bytes:
@@ -39,19 +45,46 @@ def compute_payload_signature(raw_dict: Dict[str, Any], secret_key: str) -> str:
     return compute_hmac_signature(canonical_bytes, secret_key)
 
 
+def _verify_timestamp_freshness(
+    ts: datetime,
+    max_past_skew_seconds: int = DEFAULT_CONFIG.max_timestamp_skew_seconds,
+    max_future_skew_seconds: int = DEFAULT_CONFIG.max_future_skew_seconds,
+    now: datetime | None = None,
+) -> None:
+    """Reject stale or future-skewed payload timestamps to prevent replay attacks."""
+    reference_now = now or datetime.now(timezone.utc)
+    normalized_ts = ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+    age_seconds = (reference_now - normalized_ts).total_seconds()
+
+    if age_seconds > max_past_skew_seconds:
+        raise ReplayAttackError(
+            f"Stale payload rejected: timestamp is {int(age_seconds)}s old "
+            f"(max allowed replay window is {max_past_skew_seconds}s)."
+        )
+    if age_seconds < -max_future_skew_seconds:
+        raise ReplayAttackError(
+            f"Future-skewed payload rejected: timestamp is {int(-age_seconds)}s in the future "
+            f"(max allowed clock skew is {max_future_skew_seconds}s)."
+        )
+
+
 def ingest_trigger(
     raw_dict: Dict[str, Any],
     secret_key: str,
     max_payload_bytes: int = DEFAULT_CONFIG.max_payload_bytes,
+    max_timestamp_skew_seconds: int = DEFAULT_CONFIG.max_timestamp_skew_seconds,
 ) -> RawTriggerPayload:
-    """Verify payload size, HMAC-SHA256 signature, and coerce into `RawTriggerPayload`.
+    """Verify secret strength, payload size, HMAC-SHA256 signature, schema, and replay freshness.
 
     Tokens consumed: 0.
     """
     if not isinstance(raw_dict, dict):
         raise TriggerIngestionError("Trigger payload must be a dictionary.")
-    if not secret_key or not isinstance(secret_key, str):
-        raise TriggerIngestionError("A valid non-empty secret_key is required.")
+
+    try:
+        validated_secret = DEFAULT_CONFIG.resolve_webhook_secret(secret_key)
+    except ConfigurationError as exc:
+        raise TriggerIngestionError(str(exc)) from exc
 
     # 1. Enforce 50KB size limit before parsing/validating models to prevent memory exhaustion
     try:
@@ -81,12 +114,19 @@ def ingest_trigger(
     provided_signature = str(raw_dict.get("signature", ""))
     canonical_bytes = _canonicalize_for_signing(raw_dict)
 
-    if not verify_hmac_signature(canonical_bytes, provided_signature, secret_key):
+    if not verify_hmac_signature(canonical_bytes, provided_signature, validated_secret):
         raise TriggerIngestionError("HMAC-SHA256 signature verification failed.")
 
     # 3. Validate and coerce into immutable RawTriggerPayload
     try:
-        return RawTriggerPayload.model_validate(raw_dict)
+        payload = RawTriggerPayload.model_validate(raw_dict)
     except Exception as exc:
         raise TriggerIngestionError(f"Schema validation failed for trigger payload: {exc}") from exc
 
+    # 4. Enforce timestamp replay window
+    _verify_timestamp_freshness(
+        payload.timestamp,
+        max_past_skew_seconds=max_timestamp_skew_seconds,
+    )
+
+    return payload

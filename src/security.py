@@ -1,5 +1,6 @@
 """Security hardening utilities: HMAC verification, ReDoS-safe sanitization,
-prompt-injection detection, and PII/secret leakage prevention.
+zero-width/leetspeak-aware prompt-injection detection, URL allowlisting,
+and PII/secret leakage prevention.
 """
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ import hashlib
 import hmac
 import math
 import re
+import unicodedata
 from collections import Counter
 from html.parser import HTMLParser
 from typing import Iterable, List
@@ -20,7 +22,7 @@ from urllib.parse import urlparse
 # ---------------------------------------------------------------------------
 def compute_hmac_signature(payload_bytes: bytes, secret: str) -> str:
     """Compute hexadecimal HMAC-SHA256 signature for raw payload bytes."""
-    if not secret:
+    if not secret or not secret.strip():
         raise ValueError("HMAC secret key must not be empty.")
     return hmac.new(
         secret.encode("utf-8"),
@@ -43,12 +45,66 @@ def verify_hmac_signature(payload_bytes: bytes, signature: str, secret: str) -> 
 
 
 # ---------------------------------------------------------------------------
-# 2. ReDoS-Safe Linear-Time HTML Stripping & URL Extraction
+# 2. Zero-Width / Invisible Character Removal
 # ---------------------------------------------------------------------------
-class _SafeHTMLStripper(HTMLParser):
-    """Linear-time O(N) HTML parser that strips all tags and drops script/style content."""
+_ZERO_WIDTH_CHARS = frozenset(
+    {
+        "\u200b",  # zero-width space
+        "\u200c",  # zero-width non-joiner
+        "\u200d",  # zero-width joiner
+        "\u200e",  # left-to-right mark
+        "\u200f",  # right-to-left mark
+        "\u2060",  # word joiner
+        "\u2061",  # function application
+        "\u2062",  # invisible times
+        "\u2063",  # invisible separator
+        "\u2064",  # invisible plus
+        "\ufeff",  # zero-width no-break space / BOM
+        "\u00ad",  # soft hyphen
+        "\u034f",  # combining grapheme joiner
+        "\u061c",  # arabic letter mark
+        "\u180e",  # mongolian vowel separator
+    }
+)
 
-    _IGNORED_CONTENT_TAGS = frozenset({"script", "style", "iframe", "object", "embed", "svg"})
+
+def strip_invisible_characters(text: str) -> str:
+    """Remove zero-width spaces, soft hyphens, and Unicode format (Cf) characters."""
+    if not text:
+        return ""
+    return "".join(
+        ch
+        for ch in text
+        if ch not in _ZERO_WIDTH_CHARS and unicodedata.category(ch) != "Cf"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. ReDoS-Safe Linear-Time HTML Stripping (Preserving `< 5` and `x<y`)
+# ---------------------------------------------------------------------------
+_KNOWN_HTML_TAGS = frozenset(
+    {
+        "a", "abbr", "address", "area", "article", "aside", "audio", "b", "base",
+        "bdi", "bdo", "blockquote", "body", "br", "button", "canvas", "caption",
+        "cite", "code", "col", "colgroup", "data", "datalist", "dd", "del", "details",
+        "dfn", "dialog", "div", "dl", "dt", "em", "embed", "fieldset", "figcaption",
+        "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "head",
+        "header", "hgroup", "hr", "html", "i", "iframe", "img", "input", "ins",
+        "kbd", "label", "legend", "li", "link", "main", "map", "mark", "math",
+        "menu", "meta", "meter", "nav", "noscript", "object", "ol", "optgroup",
+        "option", "output", "p", "param", "picture", "pre", "progress", "q", "rp",
+        "rt", "ruby", "s", "samp", "script", "search", "section", "select", "slot",
+        "small", "source", "span", "strong", "style", "sub", "summary", "sup", "svg",
+        "table", "tbody", "td", "template", "textarea", "tfoot", "th", "thead",
+        "time", "title", "tr", "track", "u", "ul", "var", "video", "wbr", "xss",
+    }
+)
+
+_IGNORED_CONTENT_TAGS = frozenset({"script", "style", "iframe", "object", "embed", "svg"})
+
+
+class _SafeHTMLStripper(HTMLParser):
+    """Linear-time O(N) HTML parser that strips genuine HTML tags and script/style blocks."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -56,13 +112,13 @@ class _SafeHTMLStripper(HTMLParser):
         self._skip_depth: int = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() in self._IGNORED_CONTENT_TAGS:
+        if tag.lower() in _IGNORED_CONTENT_TAGS:
             self._skip_depth += 1
         else:
             self._chunks.append(" ")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.lower() in self._IGNORED_CONTENT_TAGS and self._skip_depth > 0:
+        if tag.lower() in _IGNORED_CONTENT_TAGS and self._skip_depth > 0:
             self._skip_depth -= 1
         else:
             self._chunks.append(" ")
@@ -75,58 +131,232 @@ class _SafeHTMLStripper(HTMLParser):
         return "".join(self._chunks)
 
 
+def _preprocess_angle_brackets(raw_text: str) -> str:
+    """Distinguish real/malicious HTML tags from literal `<` comparisons (`< 5`, `x<y`) in O(N) time.
+
+    - Preserves `< 5` and `x<y` by escaping `<` to `&lt;` when `<` is not starting a known HTML tag
+      or valid `<tag>` construct.
+    - Strips unclosed/malformed HTML tag injections (e.g. `<script`, `<a href='...'` without `>`).
+    """
+    n = len(raw_text)
+    out: List[str] = []
+    i = 0
+
+    while i < n:
+        ch = raw_text[i]
+        if ch != "<":
+            out.append(ch)
+            i += 1
+            continue
+
+        # Look ahead past `<`
+        if i + 1 >= n:
+            out.append("&lt;")
+            i += 1
+            continue
+
+        nxt = raw_text[i + 1]
+
+        # Comments / declarations `<!--`, `<![`, `<!DOCTYPE`, `<?`
+        if nxt in ("!", "?"):
+            close_idx = raw_text.find(">", i + 2, min(n, i + 2048))
+            if close_idx != -1:
+                out.append(" ")
+                i = close_idx + 1
+            else:
+                out.append(" ")
+                i += 2
+            continue
+
+        # Check optional closing slash `</tag`
+        name_start = i + 2 if nxt == "/" else i + 1
+        if name_start >= n or not raw_text[name_start].isalpha():
+            # e.g., `< 5`, `<=`, `<3`, `<<` -> literal comparison/operator, NOT HTML!
+            out.append("&lt;")
+            i += 1
+            continue
+
+        # Read candidate tag identifier
+        name_end = name_start
+        while name_end < n and (raw_text[name_end].isalnum() or raw_text[name_end] in ("-", ":")):
+            name_end += 1
+        tag_name = raw_text[name_start:name_end].lower()
+
+        # Find next `<` or `>` within bounded window
+        next_gt = raw_text.find(">", name_end, min(n, name_end + 1024))
+        next_lt = raw_text.find("<", name_end, min(n, name_end + 1024))
+
+        has_clean_close = next_gt != -1 and (next_lt == -1 or next_gt < next_lt)
+        after_name_char = raw_text[name_end] if name_end < n else ""
+
+        if tag_name in _KNOWN_HTML_TAGS and after_name_char in ("", ">", "/", " ", "\t", "\n", "\r"):
+            if has_clean_close:
+                # Valid known HTML tag `<div ...>` or `</p>` -> pass through for HTMLParser to strip
+                out.append(raw_text[i : next_gt + 1])
+                i = next_gt + 1
+            else:
+                # Unclosed known HTML tag like `<script` or `<a href='...'` -> strip up to next `<` or EOL
+                skip_until = next_lt if next_lt != -1 else n
+                out.append(" ")
+                i = skip_until
+            continue
+
+        # Unknown tag name (like `x<y` or `<custom>`):
+        # Treat as HTML tag ONLY if it closes immediately (`<custom>` or `</custom>`) or has `=` attribute
+        if has_clean_close and nxt != "/":
+            inner_attr = raw_text[name_end:next_gt]
+            if inner_attr.strip() in ("", "/") or "=" in inner_attr:
+                out.append(" ")
+                i = next_gt + 1
+                continue
+        elif has_clean_close and nxt == "/" and raw_text[name_end:next_gt].strip() == "":
+            out.append(" ")
+            i = next_gt + 1
+            continue
+
+        # Otherwise it's a mathematical/code expression like `x<y` -> preserve `<` literally!
+        out.append("&lt;")
+        i += 1
+
+    return "".join(out)
+
+
 def strip_html_safely(raw_text: str) -> str:
-    """Strip HTML/script/style tags in O(N) time without backtracking regexes."""
+    """Strip HTML/script/style tags in O(N) time while preserving `< 5` and `x<y`."""
     if not raw_text:
         return ""
+    preprocessed = _preprocess_angle_brackets(raw_text)
     stripper = _SafeHTMLStripper()
-    stripper.feed(raw_text)
+    stripper.feed(preprocessed)
     stripper.close()
-    text = stripper.get_text()
-    # Remove any residual angle-bracket fragments linearly without regex backtracking
-    cleaned_chars: List[str] = []
-    in_bracket = False
-    for ch in text:
-        if ch == "<":
-            in_bracket = True
-            cleaned_chars.append(" ")
-        elif ch == ">":
-            in_bracket = False
-            cleaned_chars.append(" ")
-        elif not in_bracket:
-            cleaned_chars.append(ch)
-    return "".join(cleaned_chars)
+    return stripper.get_text()
 
 
-# Non-backtracking URL matcher bounded by character class
-_URL_RE = re.compile(r"https?://[a-zA-Z0-9._~:/?#\[\]@!$&'()*+,;=%\-]{4,512}")
+# ---------------------------------------------------------------------------
+# 4. Comprehensive URL Extraction & Allowlist Validation (Case-Insensitive + Bare Domains)
+# ---------------------------------------------------------------------------
+_COMMON_TLDS = (
+    r"(?:com|org|net|io|co|gov|edu|mil|biz|info|me|ai|app|dev|xyz|ru|cn|tk|uk|de|fr|"
+    r"jp|br|in|au|ca|nl|se|no|es|it|pl|ch|at|be|dk|fi|ie|nz|pt|sg|kr|tw|hk|my|ph|th|"
+    r"vn|id|za|mx|ar|cl|pe|us|ca|eu|tech|online|site|store|cloud|page|link|click|top|"
+    r"icu|vip|work|law|finance|bank|Pay|crypto)"
+)
+
+# Matches:
+# 1. Explicit scheme URLs: http://, https://, HTTP://, ftp://
+# 2. Protocol-relative URLs: //evil.com/path
+# 3. www. prefixed URLs: www.evil.com
+# 4. Bare domains with TLD (+ optional port/path): evil.com/login, status.example.com
+_URL_CANDIDATE_RE = re.compile(
+    r"(?<![a-zA-Z0-9_.@\-])"
+    r"(?:"
+    r"(?:https?|ftp)://[a-zA-Z0-9._~:/?#\[\]@!$&'()*+,;=%\-]{3,512}"
+    r"|//(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,24}(?::\d{1,5})?(?:/[a-zA-Z0-9._~:/?#\[\]@!$&'()*+,;=%\-]*)?"
+    r"|\bwww\.(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,24}(?::\d{1,5})?(?:/[a-zA-Z0-9._~:/?#\[\]@!$&'()*+,;=%\-]*)?"
+    r"|\b(?:[a-zA-Z0-9\-]+\.)+" + _COMMON_TLDS + r"\b(?::\d{1,5})?(?:/[a-zA-Z0-9._~:/?#\[\]@!$&'()*+,;=%\-]*)?"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def extract_urls_safely(text: str) -> List[str]:
-    """Extract HTTP/HTTPS URLs deterministically without ReDoS risk."""
+    """Extract explicit-scheme, protocol-relative, www., and bare-domain URLs without ReDoS."""
     if not text:
         return []
-    matches = _URL_RE.findall(text[:20000])
+    bounded = text[:20000]
     results: List[str] = []
-    seen = set()
-    for raw_url in matches:
-        clean_url = raw_url.rstrip(".,;:!?)>\"'")
-        if clean_url and clean_url not in seen:
-            seen.add(clean_url)
-            results.append(clean_url)
+    seen: set[str] = set()
+    for match in _URL_CANDIDATE_RE.finditer(bounded):
+        start_pos = match.start()
+        # Skip if preceded by `@` or `/` (except protocol-relative `//`)
+        if start_pos > 0 and bounded[start_pos - 1] == "@":
+            continue
+        if start_pos > 0 and bounded[start_pos - 1] == "/" and not match.group(0).startswith("//"):
+            continue
+        raw_url = match.group(0).rstrip(".,;:!?)>\"']")
+        # Skip if followed by `@` (i.e. local-part of an email address like `john.com@domain.org`)
+        end_pos = start_pos + len(raw_url)
+        if end_pos < len(bounded) and bounded[end_pos] == "@":
+            continue
+        if raw_url and raw_url not in seen:
+            seen.add(raw_url)
+            results.append(raw_url)
     return results
 
 
+def _parse_url_hostname(raw_url: str) -> tuple[str, str]:
+    """Normalize any URL candidate (including `//evil.com` or `evil.com/login`) into (scheme, host)."""
+    candidate = raw_url.strip()
+    if candidate.startswith("//"):
+        parsed = urlparse("http:" + candidate)
+        return ("http", (parsed.hostname or "").lower())
+    if "://" in candidate:
+        parsed = urlparse(candidate)
+        return ((parsed.scheme or "").lower(), (parsed.hostname or "").lower())
+    parsed = urlparse("http://" + candidate)
+    return ("http", (parsed.hostname or "").lower())
+
+
+def contains_disallowed_urls(text: str, allowed_domains: Iterable[str]) -> bool:
+    """Check if text contains any URL or bare domain not on the explicit allowlist."""
+    urls = extract_urls_safely(text)
+    if not urls:
+        return False
+    normalized_allowlist = {d.lower().strip() for d in allowed_domains}
+    for url in urls:
+        try:
+            scheme, host = _parse_url_hostname(url)
+            if scheme not in ("http", "https"):
+                return True
+            if not host or host not in normalized_allowlist:
+                return True
+        except Exception:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
-# 3. Prompt Injection & Adversarial Heuristic Detection
+# 5. Prompt Injection, Leetspeak, Zero-Width & Label-Steering Detection
 # ---------------------------------------------------------------------------
+_LEET_TRANSLATION = str.maketrans(
+    {
+        "0": "o",
+        "1": "i",
+        "3": "e",
+        "4": "a",
+        "5": "s",
+        "7": "t",
+        "@": "a",
+        "$": "s",
+    }
+)
+
+# Collapse single-letter obfuscation like `i.g.n.o.r.e` or `i-g-n-o-r-e`
+_OBFUSCATED_SEPARATOR_RE = re.compile(r"(?<=[a-zA-Z])[._\-*+~`|\\/](?=[a-zA-Z])")
+
+
+def _normalize_for_injection_scan(text: str) -> tuple[str, str]:
+    """Produce (clean_text, deobfuscated_leet_text) for robust injection scanning."""
+    no_zw = strip_invisible_characters(unicodedata.normalize("NFKC", text))
+    collapsed = _OBFUSCATED_SEPARATOR_RE.sub("", no_zw)
+    deleet = collapsed.lower().translate(_LEET_TRANSLATION)
+    return no_zw, deleet
+
+
 _PROMPT_INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # 1. Instruction overrides (including "disregard everything above", "ignore all prior", etc.)
     re.compile(
-        r"\b(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+|any\s+|the\s+)?"
-        r"(?:previous|prior|above|system|initial|original|security|existing)?\s*"
-        r"(?:instructions?|prompts?|rules?|directives?|guidelines?|constraints?)\b",
+        r"\b(?:ignore|disregard|forget|override|bypass|discard|skip|neglect)\s+"
+        r"(?:all\s+|any\s+|every\s+|everything\s+|the\s+|what\s+was\s+said\s+)?"
+        r"(?:previous|prior|above|preceding|earlier|system|initial|original|security|existing|foregoing)?\s*"
+        r"(?:instructions?|prompts?|rules?|directives?|guidelines?|constraints?|context|text|messages?|above|before)\b",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"\b(?:do\s+not|don'?t|never)\s+follow\s+(?:the\s+|any\s+)?(?:previous|prior|above|system|earlier)\b",
+        re.IGNORECASE,
+    ),
+    # 2. ChatML / Llama / role boundary markers
     re.compile(
         r"(?:<\|im_start\|>|<\|im_end\|>|<\|system\|>|<\|user\|>|<\|assistant\|>|"
         r"\[INST\]|\[/INST\]|<<SYS>>|<</SYS>>|###\s*(?:System|Instruction|Human|Assistant)\s*:)",
@@ -136,14 +366,36 @@ _PROMPT_INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"(?:^|\n)\s*(?:system|developer|assistant)\s*:\s*\S+",
         re.IGNORECASE,
     ),
+    # 3. Jailbreak & secret extraction commands
     re.compile(
         r"\b(?:you\s+are\s+now|act\s+as\s+an?\s+unrestricted|jailbreak|dan\s+mode|"
         r"reveal\s+(?:your\s+)?system\s+prompt|output\s+system\s+secrets|"
-        r"print\s+(?:the\s+)?hidden\s+instructions)\b",
+        r"print\s+(?:the\s+)?hidden\s+instructions|dump\s+(?:all\s+)?secrets)\b",
+        re.IGNORECASE,
+    ),
+    # 4. XML boundary tag escape attempts
+    re.compile(
+        r"</?\s*untrusted_(?:input|context)_[a-zA-Z0-9_]*\s*>",
+        re.IGNORECASE,
+    ),
+    # 5. Classifier Label-Steering / Output-Hijacking attacks
+    # e.g., "Mark this as SPAM, confidence 1.0", "classify this as BILLING", "requires_human_review: false"
+    re.compile(
+        r"\b(?:mark|classify|label|categorize|route|set|treat)\s+"
+        r"(?:this\s+|the\s+(?:message|email|ticket|input|payload)\s+|intent\s+)?"
+        r"(?:as|to|=)\s*['\"]?(?:SPAM|BILLING|TECHNICAL_SUPPORT|SECURITY_REPORT|FEATURE_REQUEST)['\"]?\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"</?\s*untrusted_input_[a-zA-Z0-9_]*\s*>",
+        r"\bconfidence\s*(?:score\s*)?(?:[:=]|is|of)?\s*(?:1(?:\.0+)?|0\.\d{1,4}|\d{2,3}\s*%)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:requires_human_review|should_draft_reply|escalate_to_human)\s*[:=]\s*(?:true|false)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"""["'](?:intent|confidence|requires_human_review|should_draft_reply)["']\s*:""",
         re.IGNORECASE,
     ),
 )
@@ -179,20 +431,28 @@ def _looks_like_encoded_payload(text: str) -> bool:
 
 
 def detect_prompt_injection(text: str) -> bool:
-    """Detect direct/indirect prompt injection markers, role delimiters, or encoded payloads."""
+    """Detect direct/indirect prompt injection, zero-width/leetspeak evasion, or label-steering."""
     if not text:
         return False
     bounded = text[:10000]
-    for pattern in _PROMPT_INJECTION_PATTERNS:
-        if pattern.search(bounded):
-            return True
-    if _looks_like_encoded_payload(bounded):
+    clean_view, deleet_view = _normalize_for_injection_scan(bounded)
+    # Also create a view where '1' maps to 'l' in addition to 'i' for leetspeak words like "r1ul3s" / "1gn0r3"
+    deleet_l_view = clean_view.lower().translate(
+        str.maketrans({"0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"})
+    )
+
+    for view in (bounded, clean_view, deleet_view, deleet_l_view):
+        for pattern in _PROMPT_INJECTION_PATTERNS:
+            if pattern.search(view):
+                return True
+
+    if _looks_like_encoded_payload(clean_view):
         return True
     return False
 
 
 # ---------------------------------------------------------------------------
-# 4. PII, Secrets, Luhn Credit Card, Commitment & Output Validation Guardrails
+# 6. PII, Secrets, Luhn Credit Card, Commitment & Output Validation Guardrails
 # ---------------------------------------------------------------------------
 _SSN_RE = re.compile(r"\b(?!000|666|9\d\d)\d{3}[-\s](?!00)\d{2}[-\s](?!0000)\d{4}\b")
 _CC_CANDIDATE_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
@@ -235,7 +495,7 @@ def contains_pii_or_secrets(text: str) -> bool:
     """Return True if text contains credit cards (Luhn valid), SSNs, API keys, or private IPs."""
     if not text:
         return False
-    bounded = text[:10000]
+    bounded = strip_invisible_characters(text[:10000])
     if _SSN_RE.search(bounded):
         return True
     if _API_SECRET_RE.search(bounded):
@@ -249,12 +509,31 @@ def contains_pii_or_secrets(text: str) -> bool:
 
 
 _FORBIDDEN_COMMITMENT_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\bwe\s+guarantee\s+a\s+refund\b", re.IGNORECASE),
-    re.compile(r"\bfull\s+refund\s+is\s+guaranteed\b", re.IGNORECASE),
-    re.compile(r"\blawsuit\b", re.IGNORECASE),
-    re.compile(r"\blegal\s+liability\b", re.IGNORECASE),
-    re.compile(r"\badmit\s+fault\b", re.IGNORECASE),
-    re.compile(r"\bunconditional\s+compensation\b", re.IGNORECASE),
+    # Guarantee/promise/entitle + refund/reimbursement/credit/money-back in either order within clause
+    re.compile(
+        r"\b(?:guarantee(?:d|s|ing)?|promis(?:e|ed|es|ing)|assur(?:e|ed|es|ing)|entitle(?:d|s)?)\b"
+        r"[^.;!\n]{0,80}"
+        r"\b(?:refunds?|reimburse(?:ment)?|money\s+back|compensation|payout|credit)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:refunds?|reimburse(?:ment)?|money\s+back|compensation|payout)\b"
+        r"[^.;!\n]{0,80}"
+        r"\b(?:guarantee(?:d|s|ing)?|promis(?:e|ed|es|ing)|assur(?:e|ed|es|ing)|approved|issued\s+immediately)\b",
+        re.IGNORECASE,
+    ),
+    # Liability / fault / negligence admissions
+    re.compile(
+        r"\b(?:accept(?:s|ed|ing)?|admit(?:s|ted|ting)?|assum(?:e|es|ed|ing)|acknowledg(?:e|es|ed|ing)|take)\b"
+        r"[^.;!\n]{0,60}"
+        r"\b(?:liability|fault|blame|negligence|legal\s+responsibility)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:legal\s+liability|legally\s+liable|at\s+fault|our\s+negligence|"
+        r"lawsuit|litigation|class\s+action|binding\s+settlement|unconditional\s+compensation)\b",
+        re.IGNORECASE,
+    ),
 )
 
 _HTML_TAG_CHECK_RE = re.compile(r"<[a-zA-Z!/][^>]{0,200}>")
@@ -264,31 +543,16 @@ def contains_forbidden_commitments(text: str) -> bool:
     """Check if outbound draft text makes unauthorized legal or financial commitments."""
     if not text:
         return False
-    return any(p.search(text) for p in _FORBIDDEN_COMMITMENT_PATTERNS)
+    cleaned = strip_invisible_characters(text)
+    return any(p.search(cleaned) for p in _FORBIDDEN_COMMITMENT_PATTERNS)
 
 
 def contains_unescaped_html(text: str) -> bool:
     """Check if outbound draft text contains raw/unescaped HTML or script tags."""
     if not text:
         return False
-    if _HTML_TAG_CHECK_RE.search(text):
+    cleaned = strip_invisible_characters(text)
+    if _HTML_TAG_CHECK_RE.search(cleaned):
         return True
-    lowered = text.lower()
+    lowered = cleaned.lower()
     return "<script" in lowered or "javascript:" in lowered or "onerror=" in lowered
-
-
-def contains_disallowed_urls(text: str, allowed_domains: Iterable[str]) -> bool:
-    """Check if text contains any URL whose hostname is not in the explicit allowlist."""
-    urls = extract_urls_safely(text)
-    if not urls:
-        return False
-    normalized_allowlist = {d.lower().strip() for d in allowed_domains}
-    for url in urls:
-        try:
-            parsed = urlparse(url)
-            host = (parsed.hostname or "").lower()
-            if not host or host not in normalized_allowlist:
-                return True
-        except Exception:
-            return True
-    return False

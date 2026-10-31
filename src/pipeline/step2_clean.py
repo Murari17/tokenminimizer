@@ -1,5 +1,5 @@
-"""Stage 2 [CODE — 0 Tokens]: HTML stripping, Unicode normalization, URL extraction,
-and deterministic prompt-injection scanning.
+"""Stage 2 [CODE — 0 Tokens]: HTML stripping, zero-width removal, Unicode normalization,
+URL extraction, and deterministic prompt-injection scanning.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from src.security import (
     detect_prompt_injection,
     extract_urls_safely,
     strip_html_safely,
+    strip_invisible_characters,
 )
 
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -20,11 +21,12 @@ _WORD_RE = re.compile(r"\b\w+\b")
 
 
 def _normalize_and_clean_text(text: str, max_chars: int) -> str:
-    """Normalize Unicode (NFKC), strip HTML safely, collapse whitespace, and cap length."""
+    """Normalize Unicode (NFKC), strip zero-width chars, strip HTML safely, and cap length."""
     if not text:
         return ""
     normalized = unicodedata.normalize("NFKC", text)
-    stripped = strip_html_safely(normalized)
+    visible_only = strip_invisible_characters(normalized)
+    stripped = strip_html_safely(visible_only)
     collapsed = _WHITESPACE_RE.sub(" ", stripped).strip()
     return collapsed[:max_chars]
 
@@ -35,13 +37,13 @@ def fetch_and_clean(
 ) -> CleanedPayload:
     """Clean and normalize raw input deterministically with 0 LLM tokens.
 
-    - Normalizes Unicode (`NFKC`)
-    - Strips HTML/script/style tags without backtracking regexes (ReDoS-safe)
-    - Extracts HTTP/HTTPS URLs safely
-    - Scans both raw and normalized text for prompt injection and obfuscated payloads
+    - Normalizes Unicode (`NFKC`) and removes zero-width / format (`Cf`) characters
+    - Strips HTML/script/style tags without dropping text after `< 5` or `x<y`
+    - Extracts explicit-scheme, protocol-relative, `www.`, and bare-domain URLs safely
+    - Scans both raw and cleaned text for prompt injection, leetspeak, and label-steering
     """
     raw_combined = f"{payload.raw_subject}\n{payload.raw_body}"
-    normalized_raw = unicodedata.normalize("NFKC", raw_combined)
+    normalized_raw = strip_invisible_characters(unicodedata.normalize("NFKC", raw_combined))
 
     # Extract URLs before stripping tags so anchor hrefs or plain-text URLs are captured
     extracted_urls = extract_urls_safely(normalized_raw)
@@ -49,9 +51,13 @@ def fetch_and_clean(
     clean_subject = _normalize_and_clean_text(payload.raw_subject, max_chars=500)
     clean_body = _normalize_and_clean_text(payload.raw_body, max_chars=max_body_chars)
 
-    # Scan both normalized raw text and cleaned text for prompt-injection delimiters / Base64
+    # Scan raw text, normalized text, and cleaned text for injection / label steering
     clean_combined = f"{clean_subject}\n{clean_body}"
-    suspicious = detect_prompt_injection(normalized_raw) or detect_prompt_injection(clean_combined)
+    suspicious = (
+        detect_prompt_injection(raw_combined)
+        or detect_prompt_injection(normalized_raw)
+        or detect_prompt_injection(clean_combined)
+    )
 
     word_count = len(_WORD_RE.findall(clean_body))
 
@@ -64,4 +70,3 @@ def fetch_and_clean(
         word_count=word_count,
         contains_suspicious_patterns=suspicious,
     )
-
